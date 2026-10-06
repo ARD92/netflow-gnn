@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from netflow_prototype.graph import HashConfig, WindowGraph, build_window_graph
 from netflow_prototype.schema import load_window
@@ -42,12 +43,19 @@ def load_graphs(
     """
     rng = np.random.default_rng(seed)
     graphs: list[WindowGraph] = []
+    skipped: list[str] = []
     prev_ts, prev_flows = None, None
     if context is not None:
-        prev_ts, prev_flows = context[0], load_window(context[1])
+        logger.info("Reading previous-window context %s", context[1].name)
+        ctx_flows = _safe_load(context[1])
+        if ctx_flows is not None:
+            prev_ts, prev_flows = context[0], ctx_flows
 
     for i, (ts, path) in enumerate(files):
-        flows = load_window(path)
+        flows = _safe_load(path)
+        if flows is None:
+            skipped.append(path.name)
+            continue
         lag = prev_flows if prev_ts is not None and ts - prev_ts == interval else None
         sample = flows
         if max_flows_per_window and len(flows) > max_flows_per_window:
@@ -58,4 +66,23 @@ def load_graphs(
         prev_ts, prev_flows = ts, flows
         logger.info("[%d/%d] %s: %d routers, %d flows",
                     i + 1, len(files), path.name, g.num_nodes, g.num_edges)
+
+    if skipped:
+        logger.warning("Skipped %d unreadable files: %s", len(skipped), ", ".join(skipped))
+    if not graphs:
+        raise ValueError("None of the selected files could be read.")
     return graphs
+
+
+def _safe_load(path: Path) -> pd.DataFrame | None:
+    """Load a window, returning None for truncated, corrupt, or malformed files."""
+    try:
+        flows = load_window(path)
+    except (EOFError, OSError, ValueError) as exc:
+        # EOFError: truncated gzip (file still being written or partially copied).
+        logger.warning("Skipping %s: %s: %s", path.name, type(exc).__name__, exc)
+        return None
+    if flows.empty:
+        logger.warning("Skipping %s: no valid flow records", path.name)
+        return None
+    return flows

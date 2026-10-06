@@ -46,3 +46,15 @@ def test_lag_features_use_previous_window(sample_file):
     g = build_window_graph(flows, datetime(2026, 10, 6, 12), prev_flows=flows.iloc[:2])
     assert g.prev[:, 2].tolist() == [1.0, 1.0, 0.0, 0.0]
     assert g.prev[0, 0] == pytest.approx(np.log1p(flows["bytes"].iloc[0]))
+
+
+def test_truncated_gzip_is_skipped(tmp_path, sample_file):
+    from netflow_prototype.data import load_graphs
+    from netflow_prototype.graph import HashConfig
+
+    good = sample_file
+    bad = tmp_path / "netflow.20261006.12.00.txt.gz"
+    bad.write_bytes(good.read_bytes()[:-20])  # cut off the gzip trailer
+    files = [(datetime(2026, 10, 6, 11, 50), good), (datetime(2026, 10, 6, 12, 0), bad)]
+    graphs = load_graphs(files, HashConfig())
+    assert [g.timestamp for g in graphs] == [datetime(2026, 10, 6, 11, 50)]
