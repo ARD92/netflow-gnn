@@ -115,13 +115,19 @@ def files(data_dir: Path, start: str, end: str, duration: str, verbose: bool) ->
 @click.option("--lr", default=1e-3, show_default=True)
 @click.option("--hidden-dim", default=64, show_default=True)
 @click.option("--num-layers", default=2, show_default=True)
+@click.option("--dropout", default=0.0, show_default=True)
 @click.option("--max-flows-per-window", type=int, default=None,
               help="Randomly sample at most N flows per window (large files).")
+@click.option("--chunk-size", default=250_000, show_default=True,
+              help="Flows processed per GPU chunk; lower it to use less memory.")
 @click.option("--device", default="cpu", show_default=True, help="cpu, cuda, or mps.")
+@click.option("--max-gpu-mem-gb", default=16.0, show_default=True,
+              help="Hard cap on GPU memory used by this process (0 = no cap).")
 @click.option("--seed", default=7, show_default=True)
 def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, epochs: int, lr: float, hidden_dim: int, num_layers: int,
-          max_flows_per_window: int | None, device: str, seed: int) -> None:
+          dropout: float, max_flows_per_window: int | None, chunk_size: int, device: str,
+          max_gpu_mem_gb: float, seed: int) -> None:
     """Train the GNN on all files in a time window."""
     from netflow_prototype.model import ModelConfig
     from netflow_prototype.train import TrainConfig
@@ -132,9 +138,10 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
     summary = run_train(
         fileset,
         model_dir,
-        ModelConfig(hidden_dim=hidden_dim, num_layers=num_layers),
+        ModelConfig(hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout),
         TrainConfig(epochs=epochs, lr=lr, max_flows_per_window=max_flows_per_window,
-                    device=device, seed=seed),
+                    chunk_size=chunk_size, device=device,
+                    max_gpu_mem_gb=max_gpu_mem_gb or None, seed=seed),
         context=context_file(data_dir, fileset.files[0][0], DEFAULT_INTERVAL),
     )
     meta = {k: v for k, v in summary["meta"].items() if k != "files"}
@@ -154,9 +161,14 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
 @click.option("--all-edges", is_flag=True, help="Also write every scored flow.")
 @click.option("--top", default=15, show_default=True, help="Flagged flows to print.")
 @click.option("--device", default="cpu", show_default=True)
+@click.option("--max-gpu-mem-gb", default=16.0, show_default=True,
+              help="Hard cap on GPU memory used by this process (0 = no cap).")
+@click.option("--chunk-size", default=250_000, show_default=True,
+              help="Flows scored per GPU chunk; lower it to use less memory.")
 def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, file_paths: tuple[Path, ...], out_dir: Path,
-          labels_dir: Path | None, all_edges: bool, top: int, device: str) -> None:
+          labels_dir: Path | None, all_edges: bool, top: int, device: str,
+          max_gpu_mem_gb: float, chunk_size: int) -> None:
     """Score a new time window (or explicit files) with a trained model."""
     import pandas as pd
 
@@ -171,7 +183,8 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
         context = context_file(data_dir, fileset.files[0][0])
 
     summary = run_infer(model_dir, fileset, out_dir, context=context,
-                        labels_dir=labels_dir, write_all_edges=all_edges, device=device)
+                        labels_dir=labels_dir, write_all_edges=all_edges, device=device,
+                        max_gpu_mem_gb=max_gpu_mem_gb or None, chunk_size=chunk_size)
 
     windows = pd.read_csv(out_dir / "window_scores.csv")
     click.echo("\nWindows flagged as anomalous:")

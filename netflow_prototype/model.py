@@ -22,11 +22,13 @@ At inference, each flow's anomaly score is its largest absolute z-score
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from netflow_prototype.graph import (
     NODE_FEATURE_NAMES,
@@ -37,7 +39,10 @@ from netflow_prototype.graph import (
     WindowGraph,
 )
 
+logger = logging.getLogger(__name__)
+
 LOGVAR_MIN, LOGVAR_MAX = -7.0, 5.0
+DEFAULT_CHUNK = 250_000  # edges per chunk; bounds GPU memory in training and scoring
 
 
 @dataclass
@@ -45,7 +50,7 @@ class ModelConfig:
     hidden_dim: int = 64
     id_dim: int = 16
     num_layers: int = 2
-    dropout: float = 0.1
+    dropout: float = 0.0  # 0.1 made early stopping noisy and cut F1 from ~0.99 to ~0.94
     router_buckets: int = 1024
     prefix_buckets: int = 16384
     port_buckets: int = 4096
@@ -65,11 +70,22 @@ def _mlp(in_dim: int, out_dim: int, hidden: int | None = None, dropout: float = 
     )
 
 
-def scatter_mean(values: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-    """Mean of ``values`` rows grouped by ``index`` (pure torch, no PyG needed)."""
-    out = values.new_zeros(num_nodes, values.size(1)).index_add_(0, index, values)
-    count = values.new_zeros(num_nodes).index_add_(0, index, values.new_ones(index.size(0)))
-    return out / count.clamp(min=1.0).unsqueeze(1)
+def _chunks(num_edges: int, chunk_size: int | None) -> list[slice]:
+    """Edge slices of at most ``chunk_size`` (one slice when None)."""
+    step = num_edges if not chunk_size else max(1, chunk_size)
+    return [slice(i, i + step) for i in range(0, max(num_edges, 1), step)]
+
+
+def _maybe_checkpoint(enabled: bool, fn, *args):
+    """Run ``fn`` with activation checkpointing when ``enabled``.
+
+    Only the inputs and outputs of ``fn`` are kept; its intermediate activations
+    are recomputed during backward. Dropout RNG state is preserved, so the
+    result and gradients are identical to running ``fn`` directly.
+    """
+    if enabled:
+        return checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
 
 
 class EdgeConditionedLayer(nn.Module):
@@ -82,11 +98,33 @@ class EdgeConditionedLayer(nn.Module):
         self.update = _mlp(3 * hidden, hidden, dropout=dropout)
         self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, h: torch.Tensor, e: torch.Tensor,
-                src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    def _partial_sums(self, h: torch.Tensor, e: torch.Tensor, s: torch.Tensor,
+                      d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-router message sums for one chunk of edges."""
+        zeros = h.new_zeros(h.size(0), h.size(1))
+        part_in = zeros.index_add(0, d, self.msg_fwd(torch.cat([h[s], e], dim=1)))
+        part_out = zeros.index_add(0, s, self.msg_bwd(torch.cat([h[d], e], dim=1)))
+        return part_in, part_out
+
+    def forward(self, h: torch.Tensor, e_chunks: list[torch.Tensor],
+                edge_chunks: list[tuple[torch.Tensor, torch.Tensor]],
+                src: torch.Tensor, dst: torch.Tensor, ckpt: bool = False) -> torch.Tensor:
+        """Mean-aggregate messages per router, one edge chunk at a time.
+
+        Per-edge messages only live inside a chunk; with ``ckpt`` they are
+        recomputed in backward, so peak memory is bounded by the chunk size
+        rather than the window size, for training as well as inference.
+        """
         n = h.size(0)
-        m_in = scatter_mean(self.msg_fwd(torch.cat([h[src], e], dim=1)), dst, n)
-        m_out = scatter_mean(self.msg_bwd(torch.cat([h[dst], e], dim=1)), src, n)
+        sum_in = h.new_zeros(n, h.size(1))
+        sum_out = h.new_zeros(n, h.size(1))
+        for e, (s, d) in zip(e_chunks, edge_chunks, strict=True):
+            part_in, part_out = _maybe_checkpoint(ckpt, self._partial_sums, h, e, s, d)
+            sum_in = sum_in + part_in
+            sum_out = sum_out + part_out
+        cnt_in = torch.bincount(dst, minlength=n).clamp(min=1).unsqueeze(1).to(h.dtype)
+        cnt_out = torch.bincount(src, minlength=n).clamp(min=1).unsqueeze(1).to(h.dtype)
+        m_in, m_out = sum_in / cnt_in, sum_out / cnt_out
         return self.norm(h + self.update(torch.cat([h, m_in, m_out], dim=1)))
 
 
@@ -114,24 +152,49 @@ class FlowGNN(nn.Module):
             nn.Linear(2 * h, h), nn.GELU(), nn.Linear(h, 4),
         )
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_edges(self, port_class: torch.Tensor, port_hash: torch.Tensor,
+                      src_prefix: torch.Tensor, dst_prefix: torch.Tensor,
+                      prev: torch.Tensor) -> torch.Tensor:
+        return self.edge_enc(torch.cat([
+            self.type_emb(port_class), self.port_emb(port_hash),
+            self.src_prefix_emb(src_prefix), self.dst_prefix_emb(dst_prefix), prev,
+        ], dim=1))
+
+    def _decode(self, h: torch.Tensor, e: torch.Tensor, s: torch.Tensor,
+                d: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.decoder(torch.cat([h[s], h[d], e, t.expand(e.size(0), -1)], dim=1))
+
+    def forward(self, batch: dict[str, torch.Tensor], chunk_size: int | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict (mu, logvar) for every edge of a full window.
+
+        ``chunk_size`` bounds peak memory without changing the result: edges are
+        processed in chunks, and when gradients are recorded each chunk is
+        checkpointed (recomputed in backward). Memory then scales with
+        ``num_edges x hidden_dim`` plus one chunk's activations.
+        """
         src, dst = batch["src"], batch["dst"]
+        slices = _chunks(src.size(0), chunk_size)
+        ckpt = torch.is_grad_enabled() and len(slices) > 1
+        edge_chunks = [(src[sl], dst[sl]) for sl in slices]
         t = self.time_enc(batch["time_x"]).unsqueeze(0)
 
         h = self.node_enc(torch.cat([batch["node_x"], self.router_emb(batch["router_hash"])], 1))
         h = h + t
-        e = self.edge_enc(torch.cat([
-            self.type_emb(batch["port_class"]),
-            self.port_emb(batch["port_hash"]),
-            self.src_prefix_emb(batch["src_prefix_hash"]),
-            self.dst_prefix_emb(batch["dst_prefix_hash"]),
-            batch["prev"],
-        ], dim=1))
+        e_chunks = [
+            _maybe_checkpoint(ckpt, self._encode_edges, batch["port_class"][sl],
+                              batch["port_hash"][sl], batch["src_prefix_hash"][sl],
+                              batch["dst_prefix_hash"][sl], batch["prev"][sl])
+            for sl in slices
+        ]
 
         for layer in self.layers:
-            h = layer(h, e, src, dst)
+            h = layer(h, e_chunks, edge_chunks, src, dst, ckpt)
 
-        out = self.decoder(torch.cat([h[src], h[dst], e, t.expand(e.size(0), -1)], dim=1))
+        out = torch.cat([
+            _maybe_checkpoint(ckpt, self._decode, h, e, s, d, t)
+            for e, (s, d) in zip(e_chunks, edge_chunks, strict=True)
+        ])
         mu = out[:, :2]
         logvar = out[:, 2:].clamp(LOGVAR_MIN, LOGVAR_MAX)
         return mu, logvar
@@ -141,9 +204,41 @@ def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, y: torch.Tensor) -> tor
     return 0.5 * (logvar + (y - mu) ** 2 * torch.exp(-logvar)).mean()
 
 
+EDGE_KEYS = ("src", "dst", "port_class", "port_hash", "src_prefix_hash",
+             "dst_prefix_hash", "prev", "y")
+
+
+def to_device(batch: dict[str, torch.Tensor], device: torch.device | str
+              ) -> dict[str, torch.Tensor]:
+    """Move a (compact, CPU) batch to ``device``, widening int32 indices to int64."""
+    return {k: (v.to(device, non_blocking=True).long() if not v.is_floating_point()
+                else v.to(device, non_blocking=True))
+            for k, v in batch.items()}
+
+
+def limit_gpu_memory(device: str, max_gb: float | None) -> None:
+    """Cap this process's PyTorch CUDA allocations at ``max_gb`` GiB.
+
+    Allocations past the cap raise ``torch.cuda.OutOfMemoryError`` instead of
+    consuming the rest of the GPU.
+    """
+    if not max_gb or not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return
+    dev = torch.device(device)
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    total = torch.cuda.get_device_properties(index).total_memory
+    fraction = min(1.0, max_gb * 1024**3 / total)
+    torch.cuda.set_per_process_memory_fraction(fraction, index)
+    logger.info("GPU %d memory capped at %.1f GiB of %.1f GiB",
+                index, fraction * total / 1024**3, total / 1024**3)
+
+
 def to_batch(g: WindowGraph, stats: FeatureStats, device: torch.device | str = "cpu"
              ) -> dict[str, torch.Tensor]:
-    """Normalize a WindowGraph and convert it to tensors."""
+    """Normalize a WindowGraph and convert it to tensors.
+
+    Index tensors are int32 to halve host memory; ``to_device`` widens them.
+    """
     t_mean, t_std = stats.target_mean, stats.target_std
     node_x = (g.node_x - np.asarray(stats.node_mean, np.float32)) / np.asarray(
         stats.node_std, np.float32)
@@ -154,7 +249,7 @@ def to_batch(g: WindowGraph, stats: FeatureStats, device: torch.device | str = "
     prev[~present, :2] = 0.0
 
     def long(a: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(np.ascontiguousarray(a, dtype=np.int64)).to(device)
+        return torch.from_numpy(np.ascontiguousarray(a, dtype=np.int32)).to(device)
 
     def flt(a: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(device)
@@ -171,15 +266,16 @@ def to_batch(g: WindowGraph, stats: FeatureStats, device: torch.device | str = "
 
 @torch.no_grad()
 def predict(model: FlowGNN, g: WindowGraph, stats: FeatureStats,
-            device: torch.device | str = "cpu") -> dict[str, np.ndarray]:
+            device: torch.device | str = "cpu", chunk_size: int | None = DEFAULT_CHUNK
+            ) -> dict[str, np.ndarray]:
     """Score every flow in a window.
 
     Returns z-scores, the combined anomaly score, and expected values in
     original units (bytes, route_miles).
     """
     model.eval()
-    batch = to_batch(g, stats, device)
-    mu, logvar = model(batch)
+    batch = to_device(to_batch(g, stats), device)
+    mu, logvar = model(batch, chunk_size)
     sigma = torch.exp(0.5 * logvar)
     z = ((batch["y"] - mu) / sigma).cpu().numpy()
     mu = mu.cpu().numpy() * stats.target_std + stats.target_mean

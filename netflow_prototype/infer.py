@@ -21,9 +21,14 @@ import torch
 
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph
-from netflow_prototype.model import FlowGNN, ModelConfig, predict
+from netflow_prototype.model import DEFAULT_CHUNK, FlowGNN, ModelConfig, limit_gpu_memory
 from netflow_prototype.schema import FLOW_KEY
-from netflow_prototype.train import ARTIFACT_NAME, SEEN_FLOWS_NAME
+from netflow_prototype.train import (
+    ARTIFACT_NAME,
+    SEEN_FLOWS_NAME,
+    TrainConfig,
+    predict_with_backoff,
+)
 from netflow_prototype.windows import DEFAULT_INTERVAL, FileSet
 
 logger = logging.getLogger(__name__)
@@ -73,9 +78,12 @@ def _reason(row: pd.Series, thr: float) -> str:
     return "; ".join(parts)
 
 
-def score_window(lm: LoadedModel, g: WindowGraph, device: str = "cpu") -> pd.DataFrame:
-    """Return one row per flow with predictions, z-scores, and verdicts."""
-    pred = predict(lm.model, g, lm.stats, device)
+def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig) -> pd.DataFrame:
+    """Return one row per flow with predictions, z-scores, and verdicts.
+
+    ``run`` carries the device and evaluation chunk size (halved on CUDA OOM).
+    """
+    pred = predict_with_backoff(lm.model, g, lm.stats, run)
     df = g.flows.reset_index(drop=True).copy()
     df.insert(0, "window", g.timestamp)
     df.insert(6, "flow_type", np.asarray(PORT_CLASSES)[g.port_class])
@@ -189,10 +197,14 @@ def infer(
     labels_dir: str | Path | None = None,
     write_all_edges: bool = False,
     device: str = "cpu",
+    max_gpu_mem_gb: float | None = 16.0,
+    chunk_size: int = DEFAULT_CHUNK,
 ) -> dict:
     """Score every window in ``fileset`` and write CSV reports."""
     if not fileset.files:
         raise ValueError("No NetFlow files found in the requested time window.")
+    limit_gpu_memory(device, max_gpu_mem_gb)
+    run = TrainConfig(device=device, chunk_size=chunk_size)
     lm = load_model(model_dir, device)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +219,7 @@ def infer(
         # and the recovery window is flagged instead.
         if prev_ts is not None and g.timestamp - prev_ts == DEFAULT_INTERVAL:
             g.prev[np.isin(g.flow_hash, prev_flagged)] = 0.0
-        df = score_window(lm, g, device)
+        df = score_window(lm, g, run)
         scored.append(df)
         prev_ts, prev_flagged = g.timestamp, g.flow_hash[df["is_anomalous"].to_numpy()]
     edges = pd.concat(scored, ignore_index=True)

@@ -91,8 +91,23 @@ Durations accept `90m`, `6h`, or `2d`. When it exists, the file immediately befo
 window is loaded only to provide lag features. On real servers, point
 `--data-dir` at the export directory (for example `/data1/netflow-data-for-ai`).
 
-Useful training options: `--epochs`, `--hidden-dim`, `--num-layers`,
+Useful training options: `--epochs`, `--hidden-dim`, `--num-layers`, `--dropout`,
 `--max-flows-per-window` (random sample for very large files), and `--device cuda|mps`.
+
+### GPU memory
+
+Production windows can hold millions of flows, and whole-window training on 2.4M
+flows needed more than 44 GB of VRAM. Three settings keep memory bounded:
+
+| Option (train and infer) | Default | Effect |
+|---|---|---|
+| `--max-gpu-mem-gb` | 16 | Hard cap on this process's PyTorch CUDA memory (`0` = no cap). Exceeding it raises an error instead of taking the whole GPU. |
+| `--chunk-size` | 250000 | Flows processed per chunk. Training still uses the full window: each chunk is checkpointed (recomputed during backward), so loss and gradients are identical to a single pass. Lower it to use less memory. |
+| (automatic) | | On a CUDA out-of-memory error the chunk size is halved and the step is retried. |
+
+Windows stay in host memory and move to the GPU one at a time. Peak VRAM is
+about `num_flows x hidden_dim` floats plus one chunk's activations. The training
+log reports `peak_gpu=` per epoch so you can tune `--chunk-size` and the cap.
 
 ### Outputs
 
@@ -114,20 +129,17 @@ Example `reason` values: `bytes 18.2x above expected`, `bytes 96% below expected
 
 The model was trained on 36 hours (216 windows, about 2,700 flows per window, 24 routers),
 then scored on the following 12 hours (72 windows) with injected anomalies.
-CPU training time was about 80 seconds; inference took about 5 seconds.
+Results are for chunked training (`--chunk-size 500`) across 5 random seeds.
+CPU training took 2-4 minutes per run; inference took about 5 seconds.
 
-| Metric | Value |
-|--------|-------|
-| Flow AUC | 0.993 |
-| Flow precision / recall / F1 | 0.97 / 0.91 / 0.94 |
-| Window precision / recall / F1 | 0.97 / 0.83 / 0.89 |
+| Setting | Flow F1 (5 seeds) | Flow AUC |
+|---------|-------------------|----------|
+| `dropout=0.0` (default) | 0.978-0.991, mean 0.986 | 0.998-1.000 |
+| `dropout=0.1` (earlier default) | 0.68-0.96, mean 0.87 | about 0.985 |
 
-| Anomaly type | Flow recall |
-|--------------|-------------|
-| route_change (+400-1200 miles on one router pair) | 1.00 |
-| port_scan (about 40 small flows on random high ports) | 1.00 |
-| traffic_drop (one egress falls to 2-6%) | 0.90 |
-| volume_spike (one destination prefix grows 8-25x) | 0.90 |
+With dropout off, chunked and whole-window training give the same result
+(F1 0.991 and 0.990 on the same seed). Dropout made early stopping noisy, so
+it was turned off.
 
 Synthetic results show that the pipeline works. They do not predict accuracy on
 production traffic.
