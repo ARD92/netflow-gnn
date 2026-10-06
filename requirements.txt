@@ -1,0 +1,8 @@
+# Runtime
+numpy>=1.26
+pandas>=2.1
+torch>=2.2
+click>=8.1
+
+# Tests
+pytest>=8.0
