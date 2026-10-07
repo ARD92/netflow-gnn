@@ -21,6 +21,7 @@ def test_generate_train_infer(tmp_path):
                                "--duration", "3h", "-m", str(model), "--epochs", "3"])
     assert res.exit_code == 0, res.output
     assert (model / "model.pt").exists()
+    assert (model / "pair_baseline.csv").exists()
     summary = json.loads((model / "train_summary.json").read_text())
     assert summary["meta"]["num_windows"] == 18
 

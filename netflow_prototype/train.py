@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from netflow_prototype.baselines import PairBaselineBuilder
+from netflow_prototype.baselines import save as save_pair_baseline
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import FeatureStats, WindowGraph
 from netflow_prototype.model import (
@@ -120,7 +122,9 @@ def train(
     if fileset.missing:
         logger.warning("%d expected 10-minute files are missing in the window",
                        len(fileset.missing))
+    pair_builder = PairBaselineBuilder()
     graphs = load_graphs(fileset.files, model_cfg.hashes, context=context,
+                         pair_builder=pair_builder,
                          max_flows_per_window=cfg.max_flows_per_window, seed=cfg.seed)
     train_graphs, val_graphs = _split(graphs, cfg.val_fraction)
     stats = FeatureStats.fit(train_graphs)
@@ -200,6 +204,9 @@ def train(
 
     seen = np.unique(np.concatenate([g.flow_hash for g in graphs]))
     np.save(model_dir / SEEN_FLOWS_NAME, seen)
+    pairs = pair_builder.build()
+    save_pair_baseline(pairs, model_dir)
+    logger.info("Router-pair route_miles baseline: %d pairs", len(pairs))
 
     meta = {
         "train_start": str(fileset.start),

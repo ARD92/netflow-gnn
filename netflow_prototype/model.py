@@ -51,7 +51,7 @@ class ModelConfig:
     id_dim: int = 16
     num_layers: int = 2
     dropout: float = 0.0  # 0.1 made early stopping noisy and cut F1 from ~0.99 to ~0.94
-    router_buckets: int = 1024
+    router_buckets: int = 8192  # was 1024: ~2,750 production routers collided ~3 per slot
     prefix_buckets: int = 16384
     port_buckets: int = 4096
 

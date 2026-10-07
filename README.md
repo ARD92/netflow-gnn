@@ -58,6 +58,31 @@ A persistent anomaly therefore stays flagged, and the return to normal is not
 reported as a new anomaly. The file just before the requested window is scored as
 an unreported warm-up, so the first window gets the same treatment.
 
+### route_miles: router-pair baseline
+
+route_miles belongs to the path between two routers, so it is not predicted by
+the model when a **router-pair baseline** exists. `pair_baseline.csv` (in the
+model folder) holds each ingress/egress pair's usual route_miles: the median,
+a low-high range (1st percentile of per-window minimums to 99th percentile of
+maximums, so multiple normal paths are allowed) and the number of windows seen.
+A flow is flagged on route_miles only when it is outside that range by at least
+10% of the median and 40 miles (`--miles-min-change`, `--miles-min-change-abs`).
+Reasons read `route_miles 896.3 vs usual 311.8 for this router pair (range 310.2-313.4)`.
+Pairs seen in fewer than 3 windows fall back to the model; `--no-pair-baseline`
+turns the baseline off.
+
+`train` writes the baseline automatically. For an existing model, build it from
+files without retraining (reads files in parallel):
+
+```bash
+python -m netflow_prototype pair-baseline -d /data1/netflow-data-for-ai -s "2026-10-04 00:00" -e "2026-10-06 00:00" -m models/2day --workers 8
+```
+
+Without it, the model predicted route_miles from hashed router IDs; with about
+2,750 routers in 1,024 hash slots, distinct pairs blurred together (a pair
+always at 460.6 miles was "expected" at 136). New models use 8,192 router slots
+(`--router-buckets`).
+
 ### Rules on top of the model
 
 | Rule | Behavior | Options (`infer`) |
@@ -150,7 +175,8 @@ python -m netflow_prototype visualize -f /data1/netflow-data-for-ai/netflow.2026
 | `models/<name>/model.pt` | Weights, model config, normalization stats, thresholds, training metadata |
 | `models/<name>/seen_flows.npy` | Hashes of flows seen in training (for `is_new_flow`) |
 | `models/<name>/train_summary.json` | Loss history, thresholds, file list |
-| `results/<name>/edge_anomalies.csv` | Anomalous flows (status `anomaly` or `repeated_violation`): original time and values, detected time and values, expected values, z-scores, anomaly start, reason |
+| `results/<name>/edge_anomalies.csv` | Anomalous flows (status `anomaly` or `repeated_violation`): original time and values, detected time and values, expected values, z-scores, anomaly start, reason; `miles_baseline` (`pair` or `model`) with the pair's `usual_miles_low`/`usual_miles_high` |
+| `models/<name>/pair_baseline.csv` | Usual route_miles per ingress/egress pair (median, low, high, windows) |
 | `results/<name>/new_flows.csv` | Flows with no training baseline at first observation (not anomalies), and whether they belong to a burst |
 | `results/<name>/node_scores.csv` | Per-router, per-window scores, including new-flow bursts |
 | `results/<name>/window_scores.csv` | Per-window flagged fraction, repeated violations, bursts and verdict |
@@ -201,7 +227,8 @@ production traffic.
   `--flap-window 30m --flap-min-reversals 2` to require repeated flips.
 - **Disappearing flows are not scored.** A flow that is absent in a window has no edge. A future step would add expected-but-missing edge detection per router pair.
 - **Drift.** Retrain periodically, for example weekly on a rolling 7-14 day window. At least one full day is needed to learn diurnal shape, and a week is better.
-- **Hashed identities.** Prefixes, ports, and routers use hash buckets. Increase `prefix_buckets` in `ModelConfig` for very large prefix counts.
+- **Hashed identities.** Prefixes, ports, and routers use hash buckets. Keep `--router-buckets` well above the router count (default 8,192) and raise `--prefix-buckets` (for example 131072) for millions of prefixes; both need retraining.
+- **Pair baseline reflects the training window.** A reroute that lasted through much of the training window becomes part of the usual range. Rebuild the baseline from a clean period if that happens.
 - **Very large files.** Each window is one full-batch graph. Use `--max-flows-per-window` or a GPU when windows exceed a few hundred thousand flows.
 
 ## Project structure
@@ -217,10 +244,11 @@ netflow-prototype/
     train.py       # training, early stopping, threshold calibration
     infer.py       # scoring, router/window aggregation, evaluation
     rules.py       # repeated violations, new flows and bursts, baselines, graph table
+    baselines.py   # router-pair route_miles baseline
     report.py      # readable anomaly_report.txt
     synthetic.py   # synthetic data in the production schema, with labels
     visualize.py   # draw a window's router graph as an image
-    cli.py         # generate / files / train / infer / visualize
+    cli.py         # generate / files / train / pair-baseline / infer / visualize
   tests/           # pytest suite (python -m pytest)
   requirements.txt
 ```

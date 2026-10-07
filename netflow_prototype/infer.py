@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from netflow_prototype import baselines
+from netflow_prototype.baselines import PairMilesConfig, apply_pair_baseline
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph, isin_sorted
 from netflow_prototype.model import DEFAULT_CHUNK, FlowGNN, ModelConfig, limit_gpu_memory
@@ -54,6 +56,7 @@ ANOMALY_COLUMNS = [
     "dstPort", "flow_type", "reason", "score",
     "baseline_time", "baseline_source", "anomaly_start_time",
     "baseline_route_miles", "route_miles", "expected_route_miles", "z_miles",
+    "miles_baseline", "usual_miles_low", "usual_miles_high",
     "baseline_bytes", "bytes", "expected_bytes", "z_bytes",
     "flap_changes", "miles_history", "packets", "is_new_flow", "flow_id",
 ]
@@ -80,6 +83,11 @@ class LoadedModel:
     thresholds: dict[str, float]
     meta: dict
     seen_flows: np.ndarray
+    pair_baseline: pd.DataFrame | None = None
+
+
+def lm_has_pairs(model_dir: str | Path) -> bool:
+    return (Path(model_dir) / baselines.PAIR_BASELINE_NAME).exists()
 
 
 def load_model(model_dir: str | Path, device: str = "cpu") -> LoadedModel:
@@ -94,7 +102,8 @@ def load_model(model_dir: str | Path, device: str = "cpu") -> LoadedModel:
     if len(seen) > 1 and not np.all(seen[:-1] <= seen[1:]):
         seen = np.sort(seen)  # membership checks rely on a sorted set
     return LoadedModel(model, cfg, FeatureStats(**artifact["stats"]),
-                       artifact["thresholds"], artifact["meta"], seen)
+                       artifact["thresholds"], artifact["meta"], seen,
+                       baselines.load(model_dir))
 
 
 def _reason(row: pd.Series, thr: float) -> str:
@@ -108,17 +117,25 @@ def _reason(row: pd.Series, thr: float) -> str:
         else:
             parts.append(f"bytes {100 * (1 - ratio):.0f}% below expected")
     if abs(row.z_miles) >= thr and row.status != STATUS_REPEATED:
-        parts.append(f"route_miles {row.route_miles:.1f} vs expected "
-                     f"{row.expected_route_miles:.1f}")
+        if row.miles_baseline == "pair":
+            parts.append(f"route_miles {row.route_miles:.1f} vs usual "
+                         f"{row.expected_route_miles:.1f} for this router pair "
+                         f"(range {row.usual_miles_low:.1f}-{row.usual_miles_high:.1f})")
+        else:
+            parts.append(f"route_miles {row.route_miles:.1f} vs expected "
+                         f"{row.expected_route_miles:.1f}")
     if row.is_new_flow:
         parts.append("new flow")
     return "; ".join(parts)
 
 
-def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig) -> pd.DataFrame:
+def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig,
+                 pair_cfg: PairMilesConfig | None = None) -> pd.DataFrame:
     """Return one row per flow with predictions, z-scores, and verdicts.
 
     ``run`` carries the device and evaluation chunk size (halved on CUDA OOM).
+    route_miles is judged against the router pair's usual range when the model
+    has a pair baseline (``pair_cfg`` None disables it), else by the model.
     """
     pred = predict_with_backoff(lm.model, g, lm.stats, run)
     df = g.flows.reset_index(drop=True).copy()
@@ -126,6 +143,8 @@ def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig) -> pd.DataFr
     df.insert(6, "flow_type", np.asarray(PORT_CLASSES)[g.port_class])
     for key, values in pred.items():
         df[key] = values
+    apply_pair_baseline(df, lm.pair_baseline if pair_cfg else None,
+                        pair_cfg or PairMilesConfig(), lm.thresholds["edge_score"])
     df["flow_id"] = g.flow_hash
     # g.context already holds "has a training baseline" when the graph was built with it.
     known = g.context if g.context is not None else isin_sorted(g.flow_hash, lm.seen_flows)
@@ -258,11 +277,19 @@ def infer(
     max_gpu_mem_gb: float | None = 16.0,
     chunk_size: int = DEFAULT_CHUNK,
     rules: RuleConfig | None = None,
+    pair_miles: PairMilesConfig | None = None,
+    use_pair_baseline: bool = True,
     write_readable_report: bool = False,
     report_max_flows: int = 25,
 ) -> dict:
     """Score every window in ``fileset`` and write CSV reports."""
     rules = rules or RuleConfig()
+    pair_miles = (pair_miles or PairMilesConfig()) if use_pair_baseline else None
+    if pair_miles is not None and lm_has_pairs(model_dir):
+        logger.info("route_miles judged against the router-pair baseline")
+    elif use_pair_baseline:
+        logger.warning("No %s in %s: route_miles is judged by the model. Build one with "
+                       "the pair-baseline command.", baselines.PAIR_BASELINE_NAME, model_dir)
     if not fileset.files:
         raise ValueError("No NetFlow files found in the requested time window.")
     limit_gpu_memory(device, max_gpu_mem_gb)
@@ -304,7 +331,7 @@ def infer(
             g.prev[rows, 0] = good["log_bytes"].to_numpy(dtype=float)[fresh]
             g.prev[rows, 1] = good["miles"].to_numpy(dtype=float)[fresh]
             g.prev[rows, 2] = 1.0
-        df = score_window(lm, g, run)
+        df = score_window(lm, g, run, pair_miles)
         scored.append(df)
         ok = ~df["model_flag"].to_numpy()
         update = pd.DataFrame({"log_bytes": np.log1p(df["bytes"].to_numpy()[ok]),

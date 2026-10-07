@@ -118,6 +118,10 @@ def files(data_dir: Path, start: str, end: str, duration: str, verbose: bool) ->
 @click.option("--hidden-dim", default=64, show_default=True)
 @click.option("--num-layers", default=2, show_default=True)
 @click.option("--dropout", default=0.0, show_default=True)
+@click.option("--router-buckets", default=8192, show_default=True,
+              help="Router ID hash slots; keep well above the number of routers.")
+@click.option("--prefix-buckets", default=16384, show_default=True,
+              help="Prefix hash slots; raise (e.g. 131072) for millions of prefixes.")
 @click.option("--max-flows-per-window", type=int, default=None,
               help="Randomly sample at most N flows per window (large files).")
 @click.option("--chunk-size", default=250_000, show_default=True,
@@ -128,7 +132,7 @@ def files(data_dir: Path, start: str, end: str, duration: str, verbose: bool) ->
 @click.option("--seed", default=7, show_default=True)
 def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, epochs: int, lr: float, hidden_dim: int, num_layers: int,
-          dropout: float, max_flows_per_window: int | None, chunk_size: int, device: str,
+          dropout: float, router_buckets: int, prefix_buckets: int, max_flows_per_window: int | None, chunk_size: int, device: str,
           max_gpu_mem_gb: float, seed: int) -> None:
     """Train the GNN on all files in a time window."""
     from netflow_prototype.model import ModelConfig
@@ -140,7 +144,8 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
     summary = run_train(
         fileset,
         model_dir,
-        ModelConfig(hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout),
+        ModelConfig(hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout,
+                    router_buckets=router_buckets, prefix_buckets=prefix_buckets),
         TrainConfig(epochs=epochs, lr=lr, max_flows_per_window=max_flows_per_window,
                     chunk_size=chunk_size, device=device,
                     max_gpu_mem_gb=max_gpu_mem_gb or None, seed=seed),
@@ -180,6 +185,13 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
               help="...and at least this many miles.")
 @click.option("--flap-min-reversals", default=1, show_default=True,
               help="Direction reversals needed within --flap-window (1: low-high-low).")
+@click.option("--miles-min-change", default=0.10, show_default=True,
+              help="Flag route_miles outside the router pair's usual range by this fraction "
+                   "of its median...")
+@click.option("--miles-min-change-abs", default=40.0, show_default=True,
+              help="...and by at least this many miles.")
+@click.option("--no-pair-baseline", is_flag=True,
+              help="Judge route_miles with the model instead of the router-pair baseline.")
 @click.option("--new-flow-burst", default=1000, show_default=True,
               help="First-seen new flows from one ingress in one window that make an anomaly.")
 def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
@@ -187,11 +199,13 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           labels_dir: Path | None, all_edges: bool, top: int, device: str,
           max_gpu_mem_gb: float, chunk_size: int, write_report: bool, report_max_flows: int,
           flap_window: str, flap_min_change: float, flap_min_miles: float,
-          flap_min_reversals: int, new_flow_burst: int) -> None:
+          flap_min_reversals: int, miles_min_change: float, miles_min_change_abs: float,
+          no_pair_baseline: bool, new_flow_burst: int) -> None:
     """Score a new time window (or explicit files) with a trained model."""
     import pandas as pd
 
     from netflow_prototype.infer import infer as run_infer
+    from netflow_prototype.baselines import PairMilesConfig
     from netflow_prototype.rules import RuleConfig
 
     _setup_logging(verbose)
@@ -213,6 +227,9 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
                         labels_dir=labels_dir, write_all_edges=all_edges, device=device,
                         max_gpu_mem_gb=max_gpu_mem_gb or None, chunk_size=chunk_size,
                         rules=rules, write_readable_report=write_report,
+                        pair_miles=PairMilesConfig(min_change=miles_min_change,
+                                                   min_change_miles=miles_min_change_abs),
+                        use_pair_baseline=not no_pair_baseline,
                         report_max_flows=report_max_flows)
 
     windows = pd.read_csv(out_dir / "window_scores.csv")
@@ -230,6 +247,26 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
         with pd.option_context("display.max_colwidth", 60, "display.width", 250):
             click.echo(edges[cols].head(top).to_string(index=False))
     click.echo("\n" + json.dumps(summary, indent=2, default=str))
+
+
+@main.command("pair-baseline")
+@_window_options
+@click.option("--model-dir", "-m", required=True,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Model folder to add pair_baseline.csv to.")
+@click.option("--workers", default=4, show_default=True, help="Files read in parallel.")
+def pair_baseline(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
+                  model_dir: Path, workers: int) -> None:
+    """Measure each router pair's usual route_miles from files (no training)."""
+    from netflow_prototype import baselines
+
+    _setup_logging(verbose)
+    fileset = _resolve(data_dir, start, end, duration)
+    table = baselines.build_from_files(fileset.paths, workers=workers)
+    path = baselines.save(table, model_dir)
+    stable = int((table["high_miles"] - table["low_miles"] <= 1.0).sum())
+    click.echo(json.dumps({"pairs": len(table), "pairs_with_one_distance": stable,
+                           "file": str(path)}, indent=2))
 
 
 @main.command()

@@ -37,6 +37,7 @@ def load_graphs(
     max_flows_per_window: int | None = None,
     interval: timedelta = DEFAULT_INTERVAL,
     seed: int = 0,
+    pair_builder=None,
 ) -> list[WindowGraph]:
     """Build one WindowGraph per file, wiring previous-window lag features.
 
@@ -60,6 +61,9 @@ def load_graphs(
         if flows is None:
             skipped.append(path.name)
             continue
+        if pair_builder is not None:  # router-pair route_miles baseline (full window)
+            from netflow_prototype.baselines import pair_summary
+            pair_builder.add(pair_summary(flows))
         lag = prev_flows if prev_ts is not None and ts - prev_ts == interval else None
         sample = flows
         if max_flows_per_window and len(flows) > max_flows_per_window:
