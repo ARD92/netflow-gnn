@@ -1,9 +1,16 @@
 """Inference: score a new time window (or explicit files) with a trained model.
 
 Outputs (written to ``out_dir``):
-    edge_anomalies.csv  flagged flows with expected vs. actual values and a reason
-    node_scores.csv     per-router scores per window
+    edge_anomalies.csv  anomalous flows: original (baseline) vs detected time and
+                        values, expected values, status (anomaly or
+                        repeated_violation) and a reason
+    new_flows.csv       flows with no training baseline, at first observation
+                        (reported, not anomalies)
+    node_scores.csv     per-router scores per window, including new-flow bursts
     window_scores.csv   per-window summary and verdict
+    graph_edges.csv     the scored graph: one row per window, a_node (ingress),
+                        z_node (egress)
+    anomaly_report.txt  readable report (only with ``write_report``)
     edge_scores.csv     every scored flow (only with ``write_all_edges``)
     metrics.json        evaluation against labels (only with ``labels_dir``)
 """
@@ -22,6 +29,14 @@ import torch
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph
 from netflow_prototype.model import DEFAULT_CHUNK, FlowGNN, ModelConfig, limit_gpu_memory
+from netflow_prototype.report import write_report
+from netflow_prototype.rules import (
+    STATUS_REPEATED,
+    RuleConfig,
+    add_baselines,
+    apply_rules,
+    graph_edges,
+)
 from netflow_prototype.schema import FLOW_KEY
 from netflow_prototype.train import (
     ARTIFACT_NAME,
@@ -33,7 +48,25 @@ from netflow_prototype.windows import DEFAULT_INTERVAL, FileSet
 
 logger = logging.getLogger(__name__)
 
-# A router is flagged when enough of its incident flows (or bytes) are anomalous.
+# Column order of edge_anomalies.csv and new_flows.csv (most useful first).
+ANOMALY_COLUMNS = [
+    "detected_time", "status", "ingress", "egress", "srcIpPrefix", "dstIpPrefix",
+    "dstPort", "flow_type", "reason", "score",
+    "baseline_time", "baseline_source", "anomaly_start_time",
+    "baseline_route_miles", "route_miles", "expected_route_miles", "z_miles",
+    "baseline_bytes", "bytes", "expected_bytes", "z_bytes",
+    "flap_changes", "miles_history", "packets", "is_new_flow", "flow_id",
+]
+NEW_FLOW_COLUMNS = [
+    "first_seen_time", "ingress", "egress", "srcIpPrefix", "dstIpPrefix", "dstPort",
+    "flow_type", "bytes", "route_miles", "in_new_flow_burst", "flow_id",
+]
+
+# Oldest last-normal value used as lag for a flow flagged in the previous window.
+LAST_GOOD_MAX_AGE = pd.Timedelta(hours=1)
+
+# A router is flagged when enough of its incident flows (or bytes) are anomalous,
+# or when it is the ingress of a new-flow burst.
 NODE_MIN_FLAGGED_FLOWS = 2
 NODE_FLAGGED_FRACTION = 0.05
 NODE_FLAGGED_BYTES_FRACTION = 0.10
@@ -64,17 +97,19 @@ def load_model(model_dir: str | Path, device: str = "cpu") -> LoadedModel:
 
 def _reason(row: pd.Series, thr: float) -> str:
     parts = []
+    if row.status == STATUS_REPEATED:
+        parts.append(f"route_miles flapping {row.miles_history} (repeated violation)")
     if abs(row.z_bytes) >= thr:
         ratio = row.bytes / max(row.expected_bytes, 1.0)
         if ratio >= 1:
             parts.append(f"bytes {ratio:.1f}x above expected")
         else:
             parts.append(f"bytes {100 * (1 - ratio):.0f}% below expected")
-    if abs(row.z_miles) >= thr:
+    if abs(row.z_miles) >= thr and row.status != STATUS_REPEATED:
         parts.append(f"route_miles {row.route_miles:.1f} vs expected "
                      f"{row.expected_route_miles:.1f}")
     if row.is_new_flow:
-        parts.append("flow not seen in training")
+        parts.append("new flow")
     return "; ".join(parts)
 
 
@@ -89,12 +124,18 @@ def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig) -> pd.DataFr
     df.insert(6, "flow_type", np.asarray(PORT_CLASSES)[g.port_class])
     for key, values in pred.items():
         df[key] = values
+    df["flow_id"] = g.flow_hash
     df["is_new_flow"] = ~np.isin(g.flow_hash, lm.seen_flows)
-    df["is_anomalous"] = df["score"] >= lm.thresholds["edge_score"]
+    df["model_flag"] = df["score"] >= lm.thresholds["edge_score"]
+    # Previous-window values used as lag (zeroed when that window was flagged).
+    present = g.prev[:, 2] > 0
+    df["prev_present"] = present
+    df["prev_bytes"] = np.where(present, np.expm1(g.prev[:, 0]), np.nan)
+    df["prev_route_miles"] = np.where(present, g.prev[:, 1], np.nan)
     return df
 
 
-def _node_scores(edges: pd.DataFrame) -> pd.DataFrame:
+def _node_scores(edges: pd.DataFrame, bursts: pd.DataFrame) -> pd.DataFrame:
     incident = pd.concat([
         edges[["window", "ingress", "score", "is_anomalous", "bytes"]]
         .rename(columns={"ingress": "router"}).assign(role="ingress"),
@@ -113,19 +154,29 @@ def _node_scores(edges: pd.DataFrame) -> pd.DataFrame:
     nodes["node_score"] = grouped["score"].apply(lambda s: s.nlargest(3).mean())
     nodes["flagged_fraction"] = nodes["flagged_flows"] / nodes["flows"]
     nodes["flagged_bytes_fraction"] = nodes["flagged_bytes"] / nodes["bytes"].clip(lower=1.0)
-    nodes["is_anomalous"] = (nodes["flagged_flows"] >= NODE_MIN_FLAGGED_FLOWS) & (
-        (nodes["flagged_fraction"] >= NODE_FLAGGED_FRACTION)
-        | (nodes["flagged_bytes_fraction"] >= NODE_FLAGGED_BYTES_FRACTION)
+    nodes = nodes.reset_index()
+    burst_counts = bursts.rename(columns={"ingress": "router",
+                                          "new_flows": "new_flows_first_seen"})
+    nodes = nodes.merge(burst_counts, on=["window", "router"], how="left")
+    nodes["new_flow_burst"] = nodes["new_flows_first_seen"].notna()
+    nodes["new_flows_first_seen"] = nodes["new_flows_first_seen"].fillna(0).astype(int)
+    nodes["is_anomalous"] = nodes["new_flow_burst"] | (
+        (nodes["flagged_flows"] >= NODE_MIN_FLAGGED_FLOWS) & (
+            (nodes["flagged_fraction"] >= NODE_FLAGGED_FRACTION)
+            | (nodes["flagged_bytes_fraction"] >= NODE_FLAGGED_BYTES_FRACTION)
+        )
     )
-    return (nodes.drop(columns=["flagged_bytes"]).reset_index()
+    return (nodes.drop(columns=["flagged_bytes"])
             .sort_values(["window", "node_score"], ascending=[True, False]))
 
 
-def _window_scores(edges: pd.DataFrame, thr: float) -> pd.DataFrame:
-    edges = edges.assign(flagged_bytes=edges["bytes"].where(edges["is_anomalous"], 0.0))
+def _window_scores(edges: pd.DataFrame, bursts: pd.DataFrame, thr: float) -> pd.DataFrame:
+    edges = edges.assign(flagged_bytes=edges["bytes"].where(edges["is_anomalous"], 0.0),
+                         repeated=edges["status"] == STATUS_REPEATED)
     win = edges.groupby("window").agg(
         flows=("score", "size"),
         flagged_flows=("is_anomalous", "sum"),
+        repeated_violations=("repeated", "sum"),
         new_flows=("is_new_flow", "sum"),
         max_score=("score", "max"),
         bytes=("bytes", "sum"),
@@ -133,7 +184,10 @@ def _window_scores(edges: pd.DataFrame, thr: float) -> pd.DataFrame:
     )
     win["flagged_fraction"] = win["flagged_flows"] / win["flows"]
     win["flagged_bytes_fraction"] = win["flagged_bytes"] / win["bytes"].clip(lower=1.0)
-    win["is_anomalous"] = win["flagged_fraction"] >= thr
+    win["new_flow_bursts"] = bursts.groupby("window").size().reindex(win.index).fillna(0)
+    win["new_flow_bursts"] = win["new_flow_bursts"].astype(int)
+    win["is_anomalous"] = ((win["flagged_fraction"] >= thr) | (win["new_flow_bursts"] > 0)
+                           | (win["repeated_violations"] > 0))
     return win.drop(columns=["flagged_bytes"]).reset_index()
 
 
@@ -199,8 +253,12 @@ def infer(
     device: str = "cpu",
     max_gpu_mem_gb: float | None = 16.0,
     chunk_size: int = DEFAULT_CHUNK,
+    rules: RuleConfig | None = None,
+    write_readable_report: bool = False,
+    report_max_flows: int = 25,
 ) -> dict:
     """Score every window in ``fileset`` and write CSV reports."""
+    rules = rules or RuleConfig()
     if not fileset.files:
         raise ValueError("No NetFlow files found in the requested time window.")
     limit_gpu_memory(device, max_gpu_mem_gb)
@@ -210,27 +268,69 @@ def infer(
     out_dir.mkdir(parents=True, exist_ok=True)
     edge_thr = lm.thresholds["edge_score"]
 
-    graphs = load_graphs(fileset.files, lm.config.hashes, context=context, keep_flows=True)
+    # Only flows with a training baseline build router context (new flows are scored
+    # but cannot distort the context of established flows).
+    baseline = lm.seen_flows if len(lm.seen_flows) else None
+    # The file just before the window is scored as a warm-up (not reported), so the
+    # first requested window gets masked lag and flapping history like the rest.
+    files = list(fileset.files)
+    warmup = None
+    if context is not None:
+        files, warmup = [context, *files], context[0]
+    graphs = load_graphs(files, lm.config.hashes, keep_flows=True, context_flows=baseline)
     scored: list[pd.DataFrame] = []
     prev_ts, prev_flagged = None, np.zeros(0, dtype=np.uint64)
+    # Last normal (unflagged) observation per flow: [log1p(bytes), route_miles, time].
+    last_good = pd.DataFrame({"log_bytes": pd.Series(dtype=float),
+                              "miles": pd.Series(dtype=float),
+                              "time": pd.Series(dtype="datetime64[ns]")},
+                             index=pd.Index([], dtype=np.uint64))
     for g in graphs:
-        # Anomaly-masked lag: a flow flagged in the previous window must not
-        # serve as its own baseline, otherwise persistent anomalies are absorbed
-        # and the recovery window is flagged instead.
+        # Anomaly-masked lag: a flow flagged in the previous window must not serve
+        # as its own baseline, or persistent anomalies are absorbed and the
+        # recovery window is flagged instead. Its lag becomes its last normal
+        # value (if seen within LAST_GOOD_MAX_AGE), else it is hidden.
         if prev_ts is not None and g.timestamp - prev_ts == DEFAULT_INTERVAL:
-            g.prev[np.isin(g.flow_hash, prev_flagged)] = 0.0
+            masked = np.flatnonzero(np.isin(g.flow_hash, prev_flagged))
+            g.prev[masked] = 0.0
+            good = last_good.reindex(g.flow_hash[masked])
+            age = pd.Timestamp(g.timestamp) - pd.to_datetime(good["time"])
+            fresh = (age <= LAST_GOOD_MAX_AGE).to_numpy()  # NaT (never normal) -> False
+            rows = masked[fresh]
+            g.prev[rows, 0] = good["log_bytes"].to_numpy(dtype=float)[fresh]
+            g.prev[rows, 1] = good["miles"].to_numpy(dtype=float)[fresh]
+            g.prev[rows, 2] = 1.0
         df = score_window(lm, g, run)
         scored.append(df)
-        prev_ts, prev_flagged = g.timestamp, g.flow_hash[df["is_anomalous"].to_numpy()]
+        ok = ~df["model_flag"].to_numpy()
+        update = pd.DataFrame({"log_bytes": np.log1p(df["bytes"].to_numpy()[ok]),
+                               "miles": df["route_miles"].to_numpy()[ok],
+                               "time": g.timestamp},
+                              index=pd.Index(g.flow_hash[ok], dtype=np.uint64))
+        last_good = pd.concat([last_good[~last_good.index.isin(update.index)], update])
+        prev_ts, prev_flagged = g.timestamp, g.flow_hash[~ok]
     edges = pd.concat(scored, ignore_index=True)
-    nodes = _node_scores(edges)
-    windows = _window_scores(edges, lm.thresholds["window_flagged_fraction"])
+    edges, bursts = apply_rules(edges, rules)
+    edges = add_baselines(edges, rules)
+    if warmup is not None:
+        edges = edges[edges["window"] != warmup].reset_index(drop=True)
+        bursts = bursts[bursts["window"] != warmup].reset_index(drop=True)
+        # "First seen" refers to the reported windows.
+        edges["first_seen"] = (~edges.sort_values("window", kind="stable")["flow_id"]
+                               .duplicated()).reindex(edges.index)
+    nodes = _node_scores(edges, bursts)
+    windows = _window_scores(edges, bursts, lm.thresholds["window_flagged_fraction"])
 
     flagged = edges[edges["is_anomalous"]].sort_values("score", ascending=False).copy()
     flagged["reason"] = [_reason(r, edge_thr) for r in flagged.itertuples()]
+    flagged = flagged.rename(columns={"window": "detected_time"})[ANOMALY_COLUMNS]
     flagged.to_csv(out_dir / "edge_anomalies.csv", index=False, float_format="%.4f")
+    new_flows = edges[edges["is_new_flow"] & edges["first_seen"]]
+    new_flows.rename(columns={"window": "first_seen_time"})[NEW_FLOW_COLUMNS].to_csv(
+        out_dir / "new_flows.csv", index=False, float_format="%.4f")
     nodes.to_csv(out_dir / "node_scores.csv", index=False, float_format="%.4f")
     windows.to_csv(out_dir / "window_scores.csv", index=False, float_format="%.6f")
+    graph_edges(edges).to_csv(out_dir / "graph_edges.csv", index=False, float_format="%.4f")
     if write_all_edges:
         edges.to_csv(out_dir / "edge_scores.csv", index=False, float_format="%.4f")
 
@@ -239,6 +339,9 @@ def infer(
         "anomalous_windows": int(windows["is_anomalous"].sum()),
         "flows_scored": int(len(edges)),
         "flows_flagged": int(len(flagged)),
+        "repeated_violations": int((flagged["status"] == STATUS_REPEATED).sum()),
+        "new_flows_observed": int(len(new_flows)),
+        "new_flow_bursts": int(len(bursts)),
         "routers_flagged": int(nodes["is_anomalous"].sum()),
         "missing_windows": [str(t) for t in fileset.missing],
         "thresholds": lm.thresholds,
@@ -247,4 +350,8 @@ def infer(
     if labels_dir:
         summary["metrics"] = evaluate(edges, windows, labels_dir)
         (out_dir / "metrics.json").write_text(json.dumps(summary["metrics"], indent=2))
+    if write_readable_report:
+        report = write_report(out_dir / "anomaly_report.txt", edges, nodes, windows, bursts,
+                              summary, rules, lm.meta, max_flows_per_window=report_max_flows)
+        summary["report"] = str(report)
     return summary

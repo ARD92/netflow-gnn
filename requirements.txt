@@ -3,6 +3,7 @@ numpy>=1.26
 pandas>=2.1
 torch>=2.2
 click>=8.1
+matplotlib>=3.8   # visualize command only
 
 # Tests
 pytest>=8.0

@@ -99,16 +99,22 @@ class EdgeConditionedLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden)
 
     def _partial_sums(self, h: torch.Tensor, e: torch.Tensor, s: torch.Tensor,
-                      d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-router message sums for one chunk of edges."""
+                      d: torch.Tensor, w: torch.Tensor | None
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-router message sums for one chunk of edges (weighted by ``w``)."""
         zeros = h.new_zeros(h.size(0), h.size(1))
-        part_in = zeros.index_add(0, d, self.msg_fwd(torch.cat([h[s], e], dim=1)))
-        part_out = zeros.index_add(0, s, self.msg_bwd(torch.cat([h[d], e], dim=1)))
+        msg_in = self.msg_fwd(torch.cat([h[s], e], dim=1))
+        msg_out = self.msg_bwd(torch.cat([h[d], e], dim=1))
+        if w is not None:
+            msg_in, msg_out = msg_in * w.unsqueeze(1), msg_out * w.unsqueeze(1)
+        part_in = zeros.index_add(0, d, msg_in)
+        part_out = zeros.index_add(0, s, msg_out)
         return part_in, part_out
 
     def forward(self, h: torch.Tensor, e_chunks: list[torch.Tensor],
-                edge_chunks: list[tuple[torch.Tensor, torch.Tensor]],
-                src: torch.Tensor, dst: torch.Tensor, ckpt: bool = False) -> torch.Tensor:
+                edge_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+                src: torch.Tensor, dst: torch.Tensor, ckpt: bool = False,
+                weights: torch.Tensor | None = None) -> torch.Tensor:
         """Mean-aggregate messages per router, one edge chunk at a time.
 
         Per-edge messages only live inside a chunk; with ``ckpt`` they are
@@ -118,12 +124,14 @@ class EdgeConditionedLayer(nn.Module):
         n = h.size(0)
         sum_in = h.new_zeros(n, h.size(1))
         sum_out = h.new_zeros(n, h.size(1))
-        for e, (s, d) in zip(e_chunks, edge_chunks, strict=True):
-            part_in, part_out = _maybe_checkpoint(ckpt, self._partial_sums, h, e, s, d)
+        for e, (s, d, w) in zip(e_chunks, edge_chunks, strict=True):
+            part_in, part_out = _maybe_checkpoint(ckpt, self._partial_sums, h, e, s, d, w)
             sum_in = sum_in + part_in
             sum_out = sum_out + part_out
-        cnt_in = torch.bincount(dst, minlength=n).clamp(min=1).unsqueeze(1).to(h.dtype)
-        cnt_out = torch.bincount(src, minlength=n).clamp(min=1).unsqueeze(1).to(h.dtype)
+        cnt_in = torch.bincount(dst, weights=weights, minlength=n)
+        cnt_out = torch.bincount(src, weights=weights, minlength=n)
+        cnt_in = cnt_in.clamp(min=1).unsqueeze(1).to(h.dtype)
+        cnt_out = cnt_out.clamp(min=1).unsqueeze(1).to(h.dtype)
         m_in, m_out = sum_in / cnt_in, sum_out / cnt_out
         return self.norm(h + self.update(torch.cat([h, m_in, m_out], dim=1)))
 
@@ -176,7 +184,10 @@ class FlowGNN(nn.Module):
         src, dst = batch["src"], batch["dst"]
         slices = _chunks(src.size(0), chunk_size)
         ckpt = torch.is_grad_enabled() and len(slices) > 1
-        edge_chunks = [(src[sl], dst[sl]) for sl in slices]
+        # Optional per-edge context weight: 0 = scored but excluded from messages.
+        weights = batch.get("context")
+        edge_chunks = [(src[sl], dst[sl], None if weights is None else weights[sl])
+                       for sl in slices]
         t = self.time_enc(batch["time_x"]).unsqueeze(0)
 
         h = self.node_enc(torch.cat([batch["node_x"], self.router_emb(batch["router_hash"])], 1))
@@ -189,11 +200,11 @@ class FlowGNN(nn.Module):
         ]
 
         for layer in self.layers:
-            h = layer(h, e_chunks, edge_chunks, src, dst, ckpt)
+            h = layer(h, e_chunks, edge_chunks, src, dst, ckpt, weights)
 
         out = torch.cat([
             _maybe_checkpoint(ckpt, self._decode, h, e, s, d, t)
-            for e, (s, d) in zip(e_chunks, edge_chunks, strict=True)
+            for e, (s, d, _) in zip(e_chunks, edge_chunks, strict=True)
         ])
         mu = out[:, :2]
         logvar = out[:, 2:].clamp(LOGVAR_MIN, LOGVAR_MAX)
@@ -205,7 +216,7 @@ def gaussian_nll(mu: torch.Tensor, logvar: torch.Tensor, y: torch.Tensor) -> tor
 
 
 EDGE_KEYS = ("src", "dst", "port_class", "port_hash", "src_prefix_hash",
-             "dst_prefix_hash", "prev", "y")
+             "dst_prefix_hash", "prev", "y", "context")
 
 
 def to_device(batch: dict[str, torch.Tensor], device: torch.device | str
@@ -254,7 +265,7 @@ def to_batch(g: WindowGraph, stats: FeatureStats, device: torch.device | str = "
     def flt(a: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(device)
 
-    return {
+    batch = {
         "src": long(g.src), "dst": long(g.dst),
         "node_x": flt(node_x), "router_hash": long(g.router_hash),
         "port_class": long(g.port_class), "port_hash": long(g.port_hash),
@@ -262,6 +273,9 @@ def to_batch(g: WindowGraph, stats: FeatureStats, device: torch.device | str = "
         "dst_prefix_hash": long(g.dst_prefix_hash),
         "prev": flt(prev), "y": flt(y), "time_x": flt(g.time_x),
     }
+    if g.context is not None:
+        batch["context"] = flt(g.context.astype(np.float32))
+    return batch
 
 
 @torch.no_grad()

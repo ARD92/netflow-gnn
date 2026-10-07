@@ -22,6 +22,11 @@ SMALL = ModelConfig(hidden_dim=16, id_dim=4, prefix_buckets=256)
 
 
 def _graph(num_flows: int = 400, seed: int = 0):
+    return build_window_graph(_flows(num_flows, seed), datetime(2026, 10, 6, 12),
+                              hashes=SMALL.hashes)
+
+
+def _flows(num_flows: int = 400, seed: int = 0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     routers = [f"R{i}" for i in range(12)]
     flows = pd.DataFrame({
@@ -34,7 +39,7 @@ def _graph(num_flows: int = 400, seed: int = 0):
         "packets": rng.lognormal(8, 1, num_flows),
         "route_miles": rng.uniform(10, 900, num_flows),
     })
-    return build_window_graph(flows, datetime(2026, 10, 6, 12), hashes=SMALL.hashes)
+    return flows
 
 
 def _model_and_batch():
@@ -105,3 +110,35 @@ def test_predict_with_backoff_retries_on_oom(monkeypatch):
     assert calls == [400_000, 200_000, 100_000]
     assert cfg.chunk_size == 100_000
     assert len(out["score"]) == g.num_edges
+
+
+def test_new_flows_do_not_change_context_of_established_flows():
+    """Flows outside the baseline are scored but excluded from router context."""
+    from netflow_prototype.schema import flow_hash
+
+    torch.manual_seed(0)
+    base = _graph(num_flows=300)
+    rng = np.random.default_rng(3)
+    routers = [f"R{i}" for i in range(12)]
+    extra = pd.DataFrame({
+        "ingress": "R0", "egress": rng.choice(routers, 200),
+        "srcIpPrefix": [f"172.16.{i}.0/24" for i in range(200)],
+        "dstIpPrefix": "198.51.100.0/24", "dstPort": rng.integers(1024, 65535, 200).astype(str),
+        "bytes": 5e4, "packets": 10.0, "route_miles": 25.0,
+    })
+    base_flows = _flows(300)
+    stats = FeatureStats.fit([base])
+    model = FlowGNN(SMALL).eval()
+    known = flow_hash(base_flows)
+    both = pd.concat([base_flows, extra], ignore_index=True)
+
+    def predict(flows, context_flows):
+        g = build_window_graph(flows, datetime(2026, 10, 6, 12), hashes=SMALL.hashes,
+                               context_flows=context_flows)
+        with torch.no_grad():
+            mu, _ = model(to_device(to_batch(g, stats), "cpu"), chunk_size=97)
+        return mu[:300]
+
+    reference = predict(base_flows, known)
+    assert torch.allclose(predict(both, known), reference, atol=1e-5)
+    assert not torch.allclose(predict(both, None), reference, atol=1e-3)

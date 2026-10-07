@@ -119,6 +119,7 @@ class WindowGraph:
     time_x: np.ndarray         # (4,)
     flow_hash: np.ndarray      # (E,) uint64
     flows: pd.DataFrame | None = None  # aggregated flows aligned with edges
+    context: np.ndarray | None = None  # (E,) bool: flow feeds router context (None = all)
 
     @property
     def num_nodes(self) -> int:
@@ -183,6 +184,7 @@ def build_window_graph(
     prev_flows: pd.DataFrame | None = None,
     hashes: HashConfig | None = None,
     keep_flows: bool = False,
+    context_flows: np.ndarray | None = None,
 ) -> WindowGraph:
     """Convert one aggregated window into a WindowGraph.
 
@@ -193,6 +195,10 @@ def build_window_graph(
             used as lag features. ``None`` when unavailable.
         hashes: Bucket sizes for identity hashing.
         keep_flows: Retain the flow table on the graph for reporting.
+        context_flows: Hashes of flows with a training baseline. When given, only
+            those flows build the router features and messages; other (new)
+            flows are still scored but cannot distort the context used to
+            judge established flows.
     """
     hashes = hashes or HashConfig()
     flows = flows.reset_index(drop=True)
@@ -205,6 +211,8 @@ def build_window_graph(
 
     pclass = port_class_index(flows["dstPort"])
     fhash = flow_hash(flows)
+    ctx = (np.ones(len(flows), dtype=bool) if context_flows is None
+           else np.isin(fhash, context_flows))
 
     prev = np.zeros((len(flows), 3), dtype=np.float32)
     if prev_flows is not None and len(prev_flows):
@@ -229,7 +237,8 @@ def build_window_graph(
         routers=list(routers),
         src=src,
         dst=dst,
-        node_x=_node_features(flows, src, dst, pclass, n),
+        node_x=_node_features(flows[ctx].reset_index(drop=True), src[ctx], dst[ctx],
+                              pclass[ctx], n),
         router_hash=bucket_hash(pd.Series(routers), hashes.router_buckets),
         port_class=pclass,
         port_hash=bucket_hash(flows["dstPort"], hashes.port_buckets),
@@ -240,6 +249,7 @@ def build_window_graph(
         time_x=time_features(timestamp),
         flow_hash=fhash,
         flows=flows[FLOW_KEY + ["bytes", "packets", "route_miles"]] if keep_flows else None,
+        context=None if context_flows is None else ctx,
     )
 
 

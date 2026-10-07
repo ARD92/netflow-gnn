@@ -32,6 +32,7 @@ def load_graphs(
     hashes: HashConfig,
     context: tuple[datetime, Path] | None = None,
     keep_flows: bool = False,
+    context_flows: np.ndarray | None = None,
     max_flows_per_window: int | None = None,
     interval: timedelta = DEFAULT_INTERVAL,
     seed: int = 0,
@@ -61,7 +62,8 @@ def load_graphs(
         if max_flows_per_window and len(flows) > max_flows_per_window:
             idx = rng.choice(len(flows), size=max_flows_per_window, replace=False)
             sample = flows.iloc[np.sort(idx)]
-        g = build_window_graph(sample, ts, lag, hashes, keep_flows=keep_flows)
+        g = build_window_graph(sample, ts, lag, hashes, keep_flows=keep_flows,
+                               context_flows=context_flows)
         graphs.append(g)
         prev_ts, prev_flows = ts, flows
         logger.info("[%d/%d] %s: %d routers, %d flows",

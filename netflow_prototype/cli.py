@@ -4,6 +4,7 @@
     python -m netflow_prototype files     -- show which files a time window resolves to
     python -m netflow_prototype train     -- train a model on a time window
     python -m netflow_prototype infer     -- score a time window (or explicit files)
+    python -m netflow_prototype visualize -- draw one window's router graph as an image
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from netflow_prototype.windows import (
     DEFAULT_INTERVAL,
     FileSet,
     files_from_paths,
+    parse_duration,
     parse_time,
     resolve_files,
     resolve_range,
@@ -165,16 +167,41 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
               help="Hard cap on GPU memory used by this process (0 = no cap).")
 @click.option("--chunk-size", default=250_000, show_default=True,
               help="Flows scored per GPU chunk; lower it to use less memory.")
+@click.option("--report", "write_report", is_flag=True,
+              help="Also write anomaly_report.txt, a readable summary of the anomalies.")
+@click.option("--report-max-flows", default=25, show_default=True,
+              help="Anomalous flows listed per window in the report.")
+@click.option("--flap-window", default="20m", show_default=True,
+              help="route_miles reversing within this period is a repeated violation "
+                   "(minimum 20m: three 10-minute exports).")
+@click.option("--flap-min-change", default=0.25, show_default=True,
+              help="A route_miles step counts when it exceeds this fraction of the lower value...")
+@click.option("--flap-min-miles", default=50.0, show_default=True,
+              help="...and at least this many miles.")
+@click.option("--flap-min-reversals", default=1, show_default=True,
+              help="Direction reversals needed within --flap-window (1: low-high-low).")
+@click.option("--new-flow-burst", default=1000, show_default=True,
+              help="First-seen new flows from one ingress in one window that make an anomaly.")
 def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, file_paths: tuple[Path, ...], out_dir: Path,
           labels_dir: Path | None, all_edges: bool, top: int, device: str,
-          max_gpu_mem_gb: float, chunk_size: int) -> None:
+          max_gpu_mem_gb: float, chunk_size: int, write_report: bool, report_max_flows: int,
+          flap_window: str, flap_min_change: float, flap_min_miles: float,
+          flap_min_reversals: int, new_flow_burst: int) -> None:
     """Score a new time window (or explicit files) with a trained model."""
     import pandas as pd
 
     from netflow_prototype.infer import infer as run_infer
+    from netflow_prototype.rules import RuleConfig
 
     _setup_logging(verbose)
+    try:
+        rules = RuleConfig(flap_window=parse_duration(flap_window),
+                           flap_min_change=flap_min_change, flap_min_miles=flap_min_miles,
+                           flap_min_reversals=flap_min_reversals,
+                           new_flow_burst=new_flow_burst)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
     if file_paths:
         fileset = files_from_paths(list(file_paths))
         context = context_file(fileset.paths[0].parent, fileset.files[0][0])
@@ -184,23 +211,57 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
 
     summary = run_infer(model_dir, fileset, out_dir, context=context,
                         labels_dir=labels_dir, write_all_edges=all_edges, device=device,
-                        max_gpu_mem_gb=max_gpu_mem_gb or None, chunk_size=chunk_size)
+                        max_gpu_mem_gb=max_gpu_mem_gb or None, chunk_size=chunk_size,
+                        rules=rules, write_readable_report=write_report,
+                        report_max_flows=report_max_flows)
 
     windows = pd.read_csv(out_dir / "window_scores.csv")
     click.echo("\nWindows flagged as anomalous:")
     flagged_windows = windows[windows["is_anomalous"]]
-    click.echo(flagged_windows[["window", "flows", "flagged_flows", "flagged_fraction",
-                                "max_score"]].to_string(index=False)
+    click.echo(flagged_windows[["window", "flows", "flagged_flows", "repeated_violations",
+                                "new_flow_bursts", "max_score"]].to_string(index=False)
                if len(flagged_windows) else "  none")
 
     edges = pd.read_csv(out_dir / "edge_anomalies.csv")
     click.echo(f"\nTop {min(top, len(edges))} anomalous flows:")
     if len(edges):
-        cols = ["window", "ingress", "egress", "srcIpPrefix", "dstIpPrefix", "dstPort",
-                "flow_type", "score", "reason"]
+        cols = ["detected_time", "status", "ingress", "egress", "srcIpPrefix",
+                "dstIpPrefix", "dstPort", "score", "reason"]
         with pd.option_context("display.max_colwidth", 60, "display.width", 250):
             click.echo(edges[cols].head(top).to_string(index=False))
     click.echo("\n" + json.dumps(summary, indent=2, default=str))
+
+
+@main.command()
+@click.option("--file", "-f", "file_path", required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="NetFlow file (one 10-minute window) to draw.")
+@click.option("--results", "-r", "results_dir",
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Inference output directory; colors flagged flows and routers.")
+@click.option("--out", "-o", default="graph.png", show_default=True,
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="Image path; the extension sets the format (.png, .svg, .pdf).")
+@click.option("--router", help="Only draw router pairs that include this router.")
+@click.option("--max-pairs", default=300, show_default=True,
+              help="Draw the heaviest N router pairs (flagged pairs are always drawn).")
+@click.option("--labels", type=click.Choice(["auto", "all", "none"]), default="auto",
+              show_default=True, help="auto labels all routers up to 80, else the busiest.")
+@click.option("--verbose", "-v", is_flag=True)
+def visualize(file_path: Path, results_dir: Path | None, out: Path, router: str | None,
+              max_pairs: int, labels: str, verbose: bool) -> None:
+    """Draw one window's router graph as an image."""
+    from netflow_prototype.visualize import render_window
+    from netflow_prototype.windows import file_timestamp
+
+    _setup_logging(verbose)
+    try:
+        summary = render_window(file_path, out, results_dir=results_dir,
+                                timestamp=file_timestamp(file_path), router=router,
+                                max_pairs=max_pairs, labels=labels)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    click.echo(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

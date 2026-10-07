@@ -49,13 +49,23 @@ calibrated on validation windows.
 | Level | Score | Flagged when |
 |-------|-------|--------------|
 | Flow (edge) | max of \|z\| for bytes and route_miles, where z = (actual - expected) / sigma | score >= edge threshold (validation 99.9th percentile, minimum 4.0) |
-| Router (node) | mean of its top-3 incident flow scores | >= 2 flagged flows and (>= 5% of its flows or >= 10% of its bytes) |
-| Window (graph) | fraction of flows flagged | above validation mean + 3 sigma |
+| Router (node) | mean of its top-3 incident flow scores | >= 2 flagged flows and (>= 5% of its flows or >= 10% of its bytes), or a new-flow burst |
+| Window (graph) | fraction of flows flagged | above validation mean + 3 sigma, or any repeated violation or new-flow burst |
 
-During inference, a flow flagged in window *t* has its lag hidden in window
-*t+1*. Without this, a persistent anomaly becomes its own baseline, and the
-recovery window is flagged instead. Flows not seen during training are marked
-`is_new_flow`.
+**Anomaly-masked lag**: when a flow was flagged in window *t*, its lag in window
+*t+1* is its last normal value (up to 1 hour old) instead of the anomalous one.
+A persistent anomaly therefore stays flagged, and the return to normal is not
+reported as a new anomaly. The file just before the requested window is scored as
+an unreported warm-up, so the first window gets the same treatment.
+
+### Rules on top of the model
+
+| Rule | Behavior | Options (`infer`) |
+|---|---|---|
+| **Repeated violation** | A flow whose route_miles flip low -> high -> low (or high -> low -> high) within the flap window on the same ingress/egress pair. A step counts when it changes route_miles by more than 25% of the lower value and at least 50 miles. Status `repeated_violation`, with the history in `miles_history` (for example `18:40 1363.0 -> 18:50 2862.1 -> 19:00 1353.4`). | `--flap-window 20m` (three 10-minute exports), `--flap-min-change 0.25`, `--flap-min-miles 50`, `--flap-min-reversals 1` |
+| **New flow** | A flow with no training baseline is status `new_flow`: reported in `new_flows.csv`, **not** an anomaly. New flows are scored but excluded from router context, so they cannot distort how established flows on the same routers are judged. | |
+| **New-flow burst** | At least N flows first seen in one window from the same ingress router: a router-level anomaly (`node_scores.csv`, report). | `--new-flow-burst 1000` |
+| **Original vs detected values** | Every anomalous flow lists `baseline_time`, `baseline_bytes`, `baseline_route_miles` (its last normal observation; `baseline_source` is `observed`, or `model` when none exists and the expected value is used), `detected_time` with the current values, and `anomaly_start_time`. | |
 
 ## Setup
 
@@ -82,8 +92,8 @@ python -m netflow_prototype infer -m models/demo -d data -s "2026-10-05 12:00" -
 # 4b. ...or on explicit files from a new dataset
 python -m netflow_prototype infer -m models/demo -f /path/netflow.20261006.11.50.txt.gz -f /path/netflow.20261006.12.00.txt.gz -o results/new
 
-# Optional: evaluate against label sidecars (synthetic data)
-python -m netflow_prototype infer ... --labels-dir data/labels
+# Optional: readable report (anomaly_report.txt) and evaluation against labels
+python -m netflow_prototype infer ... --report --labels-dir data/labels
 ```
 
 Times accept `YYYY-MM-DD HH:MM`, ISO 8601, or the file style `YYYYMMDD.HH.MM`.
@@ -109,6 +119,30 @@ Windows stay in host memory and move to the GPU one at a time. Peak VRAM is
 about `num_flows x hidden_dim` floats plus one chunk's activations. The training
 log reports `peak_gpu=` per epoch so you can tune `--chunk-size` and the cap.
 
+### Draw the graph as an image
+
+Each 10-minute file is one graph: routers are nodes, and flows are edges from
+the ingress router to the egress router. `visualize` draws a window with router
+pairs collapsed into one arrow each. Arrow width scales with log(bytes); nodes are
+grouped and colored by site (`src_snrc`/`dst_snrc`) and sized by bytes handled.
+Pass an inference output directory to highlight pairs with flagged flows (red,
+darker means a higher score) and anomalous routers (red outline).
+
+```bash
+# Whole network for one window, with anomalies from an inference run
+python -m netflow_prototype visualize -f /data1/netflow-data-for-ai/netflow.20261006.11.50.txt.gz -r results/20261006_1150 -o results/20261006_1150/graph.png
+
+# Only the pairs that include one router
+python -m netflow_prototype visualize -f /data1/netflow-data-for-ai/netflow.20261006.11.50.txt.gz -r results/20261006_1150 --router <ROUTER> -o router.png
+```
+
+- The extension sets the format: `.png`, `.svg` (zoomable; best for large networks), or `.pdf`.
+- `--max-pairs` (default 300) draws the heaviest pairs; flagged pairs are always drawn.
+- `--labels auto|all|none`: `auto` labels every router up to 80, otherwise the busiest 20 and anomalous ones.
+- A table of the drawn pairs (flows, bytes, route_miles, flagged flows, top reason)
+  is written next to the image as `<name>.pairs.csv`.
+- `--results` must point to an `infer` output that covers the same window.
+
 ### Outputs
 
 | File | Contents |
@@ -116,14 +150,26 @@ log reports `peak_gpu=` per epoch so you can tune `--chunk-size` and the cap.
 | `models/<name>/model.pt` | Weights, model config, normalization stats, thresholds, training metadata |
 | `models/<name>/seen_flows.npy` | Hashes of flows seen in training (for `is_new_flow`) |
 | `models/<name>/train_summary.json` | Loss history, thresholds, file list |
-| `results/<name>/edge_anomalies.csv` | Flagged flows: actual vs expected bytes and route_miles, z-scores, reason |
-| `results/<name>/node_scores.csv` | Per-router, per-window scores |
-| `results/<name>/window_scores.csv` | Per-window flagged fraction and verdict |
+| `results/<name>/edge_anomalies.csv` | Anomalous flows (status `anomaly` or `repeated_violation`): original time and values, detected time and values, expected values, z-scores, anomaly start, reason |
+| `results/<name>/new_flows.csv` | Flows with no training baseline at first observation (not anomalies), and whether they belong to a burst |
+| `results/<name>/node_scores.csv` | Per-router, per-window scores, including new-flow bursts |
+| `results/<name>/window_scores.csv` | Per-window flagged fraction, repeated violations, bursts and verdict |
+| `results/<name>/graph_edges.csv` | The scored graph: one row per window, `a_node` (ingress), `z_node` (egress), with flows, bytes, route_miles, anomalous, repeated and new flows |
+| `results/<name>/anomaly_report.txt` | Readable report grouped by window (with `--report`; `--report-max-flows` per window, default 25) |
 | `results/<name>/edge_scores.csv` | Every scored flow (with `--all-edges`) |
 | `results/<name>/metrics.json` | Evaluation (with `--labels-dir`) |
 
 Example `reason` values: `bytes 18.2x above expected`, `bytes 96% below expected`,
-`route_miles 1810.7 vs expected 851.2`, `flow not seen in training`.
+`route_miles 1810.7 vs expected 851.2`,
+`route_miles flapping 18:50 2862.1 -> 19:00 1353.4 -> 19:10 2853.8 (repeated violation)`.
+
+Example report entry:
+
+```
+[ANOMALY] SITEA401CR1 -> SITEB401CR1 | 150.250.155.128/25 -> 217.240.0.0/16 : 443 (web)   score 7.9
+    bytes:       539,400,614 at 2026-10-05 18:40  ->  15,050,594,090 at 2026-10-05 19:00  (expected 739,293,440, z=+7.9)
+    anomaly started: 2026-10-05 18:50
+```
 
 ## Results on synthetic data
 
@@ -147,6 +193,12 @@ production traffic.
 ## Limitations and next steps
 
 - **Training data is assumed mostly normal.** Exclude known incident periods from the training window.
+- **New flows are not anomalies by design.** Small scans or egress shifts onto new
+  flow keys below the burst threshold are only listed in `new_flows.csv`. Lower
+  `--new-flow-burst` to catch smaller bursts.
+- **Single excursions count as flapping.** With the defaults, a route_miles change
+  that lasts one window (low -> high -> low) is a repeated violation. Use
+  `--flap-window 30m --flap-min-reversals 2` to require repeated flips.
 - **Disappearing flows are not scored.** A flow that is absent in a window has no edge. A future step would add expected-but-missing edge detection per router pair.
 - **Drift.** Retrain periodically, for example weekly on a rolling 7-14 day window. At least one full day is needed to learn diurnal shape, and a week is better.
 - **Hashed identities.** Prefixes, ports, and routers use hash buckets. Increase `prefix_buckets` in `ModelConfig` for very large prefix counts.
@@ -164,8 +216,11 @@ netflow-prototype/
     model.py       # FlowGNN (edge-conditioned message passing + Gaussian heads)
     train.py       # training, early stopping, threshold calibration
     infer.py       # scoring, router/window aggregation, evaluation
+    rules.py       # repeated violations, new flows and bursts, baselines, graph table
+    report.py      # readable anomaly_report.txt
     synthetic.py   # synthetic data in the production schema, with labels
-    cli.py         # generate / files / train / infer
+    visualize.py   # draw a window's router graph as an image
+    cli.py         # generate / files / train / infer / visualize
   tests/           # pytest suite (python -m pytest)
   requirements.txt
 ```
