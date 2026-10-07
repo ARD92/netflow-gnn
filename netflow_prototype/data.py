@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -53,7 +54,9 @@ def load_graphs(
             prev_ts, prev_flows = context[0], ctx_flows
 
     for i, (ts, path) in enumerate(files):
+        t0 = time.perf_counter()
         flows = _safe_load(path)
+        t_read = time.perf_counter() - t0
         if flows is None:
             skipped.append(path.name)
             continue
@@ -62,12 +65,14 @@ def load_graphs(
         if max_flows_per_window and len(flows) > max_flows_per_window:
             idx = rng.choice(len(flows), size=max_flows_per_window, replace=False)
             sample = flows.iloc[np.sort(idx)]
+        t0 = time.perf_counter()
         g = build_window_graph(sample, ts, lag, hashes, keep_flows=keep_flows,
                                context_flows=context_flows)
+        t_graph = time.perf_counter() - t0
         graphs.append(g)
         prev_ts, prev_flows = ts, flows
-        logger.info("[%d/%d] %s: %d routers, %d flows",
-                    i + 1, len(files), path.name, g.num_nodes, g.num_edges)
+        logger.info("[%d/%d] %s: %d routers, %d flows (read+aggregate %.1fs, graph %.1fs)",
+                    i + 1, len(files), path.name, g.num_nodes, g.num_edges, t_read, t_graph)
 
     if skipped:
         logger.warning("Skipped %d unreadable files: %s", len(skipped), ", ".join(skipped))

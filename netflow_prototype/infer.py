@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 
 from netflow_prototype.data import load_graphs
-from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph
+from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph, isin_sorted
 from netflow_prototype.model import DEFAULT_CHUNK, FlowGNN, ModelConfig, limit_gpu_memory
 from netflow_prototype.report import write_report
 from netflow_prototype.rules import (
@@ -91,6 +91,8 @@ def load_model(model_dir: str | Path, device: str = "cpu") -> LoadedModel:
     model.eval()
     seen_path = model_dir / SEEN_FLOWS_NAME
     seen = np.load(seen_path) if seen_path.exists() else np.zeros(0, dtype=np.uint64)
+    if len(seen) > 1 and not np.all(seen[:-1] <= seen[1:]):
+        seen = np.sort(seen)  # membership checks rely on a sorted set
     return LoadedModel(model, cfg, FeatureStats(**artifact["stats"]),
                        artifact["thresholds"], artifact["meta"], seen)
 
@@ -125,7 +127,9 @@ def score_window(lm: LoadedModel, g: WindowGraph, run: TrainConfig) -> pd.DataFr
     for key, values in pred.items():
         df[key] = values
     df["flow_id"] = g.flow_hash
-    df["is_new_flow"] = ~np.isin(g.flow_hash, lm.seen_flows)
+    # g.context already holds "has a training baseline" when the graph was built with it.
+    known = g.context if g.context is not None else isin_sorted(g.flow_hash, lm.seen_flows)
+    df["is_new_flow"] = ~known
     df["model_flag"] = df["score"] >= lm.thresholds["edge_score"]
     # Previous-window values used as lag (zeroed when that window was flagged).
     present = g.prev[:, 2] > 0

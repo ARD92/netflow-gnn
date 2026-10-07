@@ -72,6 +72,19 @@ def port_class_index(ports: pd.Series) -> np.ndarray:
     return lookup[codes] if len(uniques) else np.zeros(0, dtype=np.int64)
 
 
+def isin_sorted(values: np.ndarray, sorted_set: np.ndarray) -> np.ndarray:
+    """``np.isin`` for a pre-sorted set, via binary search.
+
+    ``np.isin`` sorts both arrays on every call; with tens of millions of
+    training flows that took ~35 s per call. Binary search takes well under 1 s.
+    """
+    if len(sorted_set) == 0:
+        return np.zeros(len(values), dtype=bool)
+    idx = np.searchsorted(sorted_set, values)
+    idx[idx == len(sorted_set)] = 0
+    return sorted_set[idx] == values
+
+
 def bucket_hash(values: pd.Series, buckets: int) -> np.ndarray:
     """Stable hash of string values into ``[0, buckets)``."""
     h = pd.util.hash_pandas_object(values, index=False).to_numpy(np.uint64)
@@ -195,7 +208,7 @@ def build_window_graph(
             used as lag features. ``None`` when unavailable.
         hashes: Bucket sizes for identity hashing.
         keep_flows: Retain the flow table on the graph for reporting.
-        context_flows: Hashes of flows with a training baseline. When given, only
+        context_flows: SORTED hashes of flows with a training baseline. When given, only
             those flows build the router features and messages; other (new)
             flows are still scored but cannot distort the context used to
             judge established flows.
@@ -212,7 +225,7 @@ def build_window_graph(
     pclass = port_class_index(flows["dstPort"])
     fhash = flow_hash(flows)
     ctx = (np.ones(len(flows), dtype=bool) if context_flows is None
-           else np.isin(fhash, context_flows))
+           else isin_sorted(fhash, context_flows))
 
     prev = np.zeros((len(flows), 3), dtype=np.float32)
     if prev_flows is not None and len(prev_flows):

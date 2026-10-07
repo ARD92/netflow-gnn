@@ -58,3 +58,14 @@ def test_truncated_gzip_is_skipped(tmp_path, sample_file):
     files = [(datetime(2026, 10, 6, 11, 50), good), (datetime(2026, 10, 6, 12, 0), bad)]
     graphs = load_graphs(files, HashConfig())
     assert [g.timestamp for g in graphs] == [datetime(2026, 10, 6, 11, 50)]
+
+
+def test_isin_sorted_matches_np_isin():
+    from netflow_prototype.graph import isin_sorted
+
+    rng = np.random.default_rng(0)
+    seen = np.unique(rng.integers(0, 2**63, 5000).astype(np.uint64))
+    values = np.concatenate([seen[::3], rng.integers(0, 2**63, 2000).astype(np.uint64),
+                             np.array([0, 2**64 - 1], dtype=np.uint64)])
+    assert (isin_sorted(values, seen) == np.isin(values, seen)).all()
+    assert not isin_sorted(values, np.zeros(0, dtype=np.uint64)).any()
