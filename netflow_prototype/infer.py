@@ -27,6 +27,9 @@ import pandas as pd
 import torch
 
 from netflow_prototype import baselines
+from netflow_prototype.appbaseline import EVENT_COLUMNS, AppBaseline, AppRuleConfig, detect_app_events
+from netflow_prototype.enrich import PrefixEnricher, applications, enrich_prefixes, model_port_map
+from netflow_prototype.patterns import PatternConfig, find_patterns
 from netflow_prototype.baselines import PairMilesConfig, apply_pair_baseline
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import PORT_CLASSES, FeatureStats, WindowGraph, isin_sorted
@@ -53,13 +56,16 @@ logger = logging.getLogger(__name__)
 # Column order of edge_anomalies.csv and new_flows.csv (most useful first).
 ANOMALY_COLUMNS = [
     "detected_time", "status", "ingress", "egress", "srcIpPrefix", "dstIpPrefix",
-    "dstPort", "flow_type", "reason", "score",
+    "dstPort", "flow_type", "application", "reason", "score",
     "baseline_time", "baseline_source", "anomaly_start_time",
     "baseline_route_miles", "route_miles", "expected_route_miles", "z_miles",
     "miles_baseline", "usual_miles_low", "usual_miles_high",
     "baseline_bytes", "bytes", "expected_bytes", "z_bytes",
     "flap_changes", "miles_history", "packets", "is_new_flow", "flow_id",
 ]
+# Added when --enrich-prefixes is given.
+ENRICHED_COLUMNS = ["service", "customer", "src_customer", "src_service", "src_asn",
+                    "dst_customer", "dst_service", "dst_asn"]
 NEW_FLOW_COLUMNS = [
     "first_seen_time", "ingress", "egress", "srcIpPrefix", "dstIpPrefix", "dstPort",
     "flow_type", "bytes", "route_miles", "in_new_flow_burst", "flow_id",
@@ -193,7 +199,8 @@ def _node_scores(edges: pd.DataFrame, bursts: pd.DataFrame) -> pd.DataFrame:
             .sort_values(["window", "node_score"], ascending=[True, False]))
 
 
-def _window_scores(edges: pd.DataFrame, bursts: pd.DataFrame, thr: float) -> pd.DataFrame:
+def _window_scores(edges: pd.DataFrame, bursts: pd.DataFrame, thr: float,
+                   events: pd.DataFrame | None = None) -> pd.DataFrame:
     edges = edges.assign(flagged_bytes=edges["bytes"].where(edges["is_anomalous"], 0.0),
                          repeated=edges["status"] == STATUS_REPEATED)
     win = edges.groupby("window").agg(
@@ -209,8 +216,11 @@ def _window_scores(edges: pd.DataFrame, bursts: pd.DataFrame, thr: float) -> pd.
     win["flagged_bytes_fraction"] = win["flagged_bytes"] / win["bytes"].clip(lower=1.0)
     win["new_flow_bursts"] = bursts.groupby("window").size().reindex(win.index).fillna(0)
     win["new_flow_bursts"] = win["new_flow_bursts"].astype(int)
+    counts = (events.groupby("window").size() if events is not None and len(events)
+              else pd.Series(dtype=int))
+    win["app_events"] = counts.reindex(win.index).fillna(0).astype(int)
     win["is_anomalous"] = ((win["flagged_fraction"] >= thr) | (win["new_flow_bursts"] > 0)
-                           | (win["repeated_violations"] > 0))
+                           | (win["repeated_violations"] > 0) | (win["app_events"] > 0))
     return win.drop(columns=["flagged_bytes"]).reset_index()
 
 
@@ -281,6 +291,12 @@ def infer(
     use_pair_baseline: bool = True,
     write_readable_report: bool = False,
     report_max_flows: int = 25,
+    cache_dir: str | Path | None = None,
+    workers: int = 1,
+    port_map: str | Path | None = None,
+    enrich_prefixes_file: str | Path | None = None,
+    app_rules: AppRuleConfig | None = None,
+    patterns_cfg: PatternConfig | None = None,
 ) -> dict:
     """Score every window in ``fileset`` and write CSV reports."""
     rules = rules or RuleConfig()
@@ -289,7 +305,7 @@ def infer(
         logger.info("route_miles judged against the router-pair baseline")
     elif use_pair_baseline:
         logger.warning("No %s in %s: route_miles is judged by the model. Build one with "
-                       "the pair-baseline command.", baselines.PAIR_BASELINE_NAME, model_dir)
+                       "the baselines command.", baselines.PAIR_BASELINE_NAME, model_dir)
     if not fileset.files:
         raise ValueError("No NetFlow files found in the requested time window.")
     limit_gpu_memory(device, max_gpu_mem_gb)
@@ -308,7 +324,8 @@ def infer(
     warmup = None
     if context is not None:
         files, warmup = [context, *files], context[0]
-    graphs = load_graphs(files, lm.config.hashes, keep_flows=True, context_flows=baseline)
+    graphs = load_graphs(files, lm.config.hashes, keep_flows=True, context_flows=baseline,
+                         cache_dir=cache_dir, workers=workers)
     scored: list[pd.DataFrame] = []
     prev_ts, prev_flagged = None, np.zeros(0, dtype=np.uint64)
     # Last normal (unflagged) observation per flow: [log1p(bytes), route_miles, time].
@@ -349,12 +366,37 @@ def infer(
         # "First seen" refers to the reported windows.
         edges["first_seen"] = (~edges.sort_values("window", kind="stable")["flow_id"]
                                .duplicated()).reindex(edges.index)
+
+    # Enrichment: application from dstPort; customer/service from prefixes (optional).
+    edges["application"] = applications(edges["dstPort"], model_port_map(model_dir, port_map))
+    if enrich_prefixes_file:
+        enricher = PrefixEnricher.from_file(enrich_prefixes_file)
+        logger.info("Enriching prefixes from %s (%d prefixes)", enrich_prefixes_file,
+                    enricher.size)
+        enrich_prefixes(edges, enricher)
+
+    # Application-level events against the application baselines.
+    app_base = AppBaseline.load(model_dir)
+    if app_base is None:
+        logger.warning("No application baselines in %s: application rules skipped. Build "
+                       "them with the baselines command.", model_dir)
+        events = pd.DataFrame(columns=EVENT_COLUMNS)
+    else:
+        found = [detect_app_events(edges[edges["window"] == ts], ts, app_base,
+                                   app_rules or AppRuleConfig())
+                 for ts in sorted(edges["window"].unique())]
+        found = [f for f in found if len(f)]
+        events = (pd.concat(found, ignore_index=True) if found
+                  else pd.DataFrame(columns=EVENT_COLUMNS))
+
     nodes = _node_scores(edges, bursts)
-    windows = _window_scores(edges, bursts, lm.thresholds["window_flagged_fraction"])
+    windows = _window_scores(edges, bursts, lm.thresholds["window_flagged_fraction"], events)
+    patterns = find_patterns(edges, events, patterns_cfg)
 
     flagged = edges[edges["is_anomalous"]].sort_values("score", ascending=False).copy()
     flagged["reason"] = [_reason(r, edge_thr) for r in flagged.itertuples()]
-    flagged = flagged.rename(columns={"window": "detected_time"})[ANOMALY_COLUMNS]
+    flagged = flagged.rename(columns={"window": "detected_time"})
+    flagged = flagged[[c for c in ANOMALY_COLUMNS + ENRICHED_COLUMNS if c in flagged.columns]]
     flagged.to_csv(out_dir / "edge_anomalies.csv", index=False, float_format="%.4f")
     new_flows = edges[edges["is_new_flow"] & edges["first_seen"]]
     new_flows.rename(columns={"window": "first_seen_time"})[NEW_FLOW_COLUMNS].to_csv(
@@ -362,6 +404,8 @@ def infer(
     nodes.to_csv(out_dir / "node_scores.csv", index=False, float_format="%.4f")
     windows.to_csv(out_dir / "window_scores.csv", index=False, float_format="%.6f")
     graph_edges(edges).to_csv(out_dir / "graph_edges.csv", index=False, float_format="%.4f")
+    events.to_csv(out_dir / "app_anomalies.csv", index=False, float_format="%.4f")
+    patterns.to_csv(out_dir / "anomaly_patterns.csv", index=False, float_format="%.4f")
     if write_all_edges:
         edges.to_csv(out_dir / "edge_scores.csv", index=False, float_format="%.4f")
 
@@ -374,6 +418,9 @@ def infer(
         "new_flows_observed": int(len(new_flows)),
         "new_flow_bursts": int(len(bursts)),
         "routers_flagged": int(nodes["is_anomalous"].sum()),
+        "app_events": events["kind"].value_counts().to_dict(),
+        "patterns": patterns.loc[(patterns["scope"] == "all windows") & patterns["is_pattern"],
+                                 "statement"].tolist(),
         "missing_windows": [str(t) for t in fileset.missing],
         "thresholds": lm.thresholds,
         "out_dir": str(out_dir),
@@ -383,6 +430,7 @@ def infer(
         (out_dir / "metrics.json").write_text(json.dumps(summary["metrics"], indent=2))
     if write_readable_report:
         report = write_report(out_dir / "anomaly_report.txt", edges, nodes, windows, bursts,
-                              summary, rules, lm.meta, max_flows_per_window=report_max_flows)
+                              summary, rules, lm.meta, max_flows_per_window=report_max_flows,
+                              events=events, patterns=patterns)
         summary["report"] = str(report)
     return summary

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -11,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from netflow_prototype.graph import HashConfig, WindowGraph, build_window_graph
-from netflow_prototype.schema import load_window
+from netflow_prototype.cache import load_window_cached
 from netflow_prototype.windows import DEFAULT_INTERVAL, file_name
 
 logger = logging.getLogger(__name__)
@@ -37,12 +40,15 @@ def load_graphs(
     max_flows_per_window: int | None = None,
     interval: timedelta = DEFAULT_INTERVAL,
     seed: int = 0,
-    pair_builder=None,
+    window_observer=None,
+    cache_dir: str | Path | None = None,
+    workers: int = 1,
 ) -> list[WindowGraph]:
     """Build one WindowGraph per file, wiring previous-window lag features.
 
     Lag features are only used when the previous file is exactly one interval
-    earlier; a gap in the data resets them.
+    earlier; a gap in the data resets them. Files are read through the flow
+    cache when ``cache_dir`` is set, by ``workers`` processes in parallel.
     """
     rng = np.random.default_rng(seed)
     graphs: list[WindowGraph] = []
@@ -50,20 +56,17 @@ def load_graphs(
     prev_ts, prev_flows = None, None
     if context is not None:
         logger.info("Reading previous-window context %s", context[1].name)
-        ctx_flows = _safe_load(context[1])
+        ctx_flows = _safe_load(context[1], cache_dir)
         if ctx_flows is not None:
             prev_ts, prev_flows = context[0], ctx_flows
 
-    for i, (ts, path) in enumerate(files):
-        t0 = time.perf_counter()
-        flows = _safe_load(path)
-        t_read = time.perf_counter() - t0
+    loaded = iter_flows([p for _, p in files], cache_dir=cache_dir, workers=workers)
+    for i, ((ts, path), (_, flows, t_read)) in enumerate(zip(files, loaded, strict=True)):
         if flows is None:
             skipped.append(path.name)
             continue
-        if pair_builder is not None:  # router-pair route_miles baseline (full window)
-            from netflow_prototype.baselines import pair_summary
-            pair_builder.add(pair_summary(flows))
+        if window_observer is not None:  # e.g. baselines built from the full window
+            window_observer(ts, flows)
         lag = prev_flows if prev_ts is not None and ts - prev_ts == interval else None
         sample = flows
         if max_flows_per_window and len(flows) > max_flows_per_window:
@@ -75,7 +78,7 @@ def load_graphs(
         t_graph = time.perf_counter() - t0
         graphs.append(g)
         prev_ts, prev_flows = ts, flows
-        logger.info("[%d/%d] %s: %d routers, %d flows (read+aggregate %.1fs, graph %.1fs)",
+        logger.info("[%d/%d] %s: %d routers, %d flows (load %.1fs, graph %.1fs)",
                     i + 1, len(files), path.name, g.num_nodes, g.num_edges, t_read, t_graph)
 
     if skipped:
@@ -85,10 +88,41 @@ def load_graphs(
     return graphs
 
 
-def _safe_load(path: Path) -> pd.DataFrame | None:
+def iter_flows(paths: list[Path], cache_dir: str | Path | None = None, workers: int = 1
+               ) -> Iterator[tuple[Path, pd.DataFrame | None, float]]:
+    """Yield (path, aggregated flows or None, seconds waited) in input order.
+
+    With ``workers`` > 1, files are parsed in that many processes with a
+    bounded read-ahead, so memory holds at most ``workers + 1`` windows.
+    """
+    if workers <= 1 or len(paths) <= 1:
+        for path in paths:
+            t0 = time.perf_counter()
+            flows = _safe_load(path, cache_dir)
+            yield path, flows, time.perf_counter() - t0
+        return
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        pending: deque = deque()
+        queue = iter(paths)
+        for path in queue:
+            pending.append((path, pool.submit(_safe_load, path, cache_dir)))
+            if len(pending) > workers:
+                break
+        while pending:
+            path, future = pending.popleft()
+            t0 = time.perf_counter()
+            flows = future.result()
+            waited = time.perf_counter() - t0
+            nxt = next(queue, None)
+            if nxt is not None:
+                pending.append((nxt, pool.submit(_safe_load, nxt, cache_dir)))
+            yield path, flows, waited
+
+
+def _safe_load(path: Path, cache_dir: str | Path | None = None) -> pd.DataFrame | None:
     """Load a window, returning None for truncated, corrupt, or malformed files."""
     try:
-        flows = load_window(path)
+        flows = load_window_cached(path, cache_dir)
     except (EOFError, OSError, ValueError) as exc:
         # EOFError: truncated gzip (file still being written or partially copied).
         logger.warning("Skipping %s: %s: %s", path.name, type(exc).__name__, exc)

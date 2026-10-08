@@ -70,6 +70,21 @@ def _resolve(data_dir: Path | None, start: str | None, end: str | None,
     return fileset
 
 
+def _io_options(func):
+    """Flow cache and parallel reading, shared by commands that read exports."""
+    options = [
+        click.option("--cache-dir", type=click.Path(file_okay=False, path_type=Path),
+                     envvar="NETFLOW_CACHE_DIR", show_envvar=True,
+                     help="Reuse parsed exports from this cache (see the prepare command); "
+                          "missing entries are parsed and added."),
+        click.option("--workers", default=4, show_default=True,
+                     help="Exports parsed in parallel."),
+    ]
+    for option in reversed(options):
+        func = option(func)
+    return func
+
+
 @click.group()
 def main() -> None:
     """GNN-based anomaly detection for 10-minute NetFlow exports."""
@@ -130,10 +145,15 @@ def files(data_dir: Path, start: str, end: str, duration: str, verbose: bool) ->
 @click.option("--max-gpu-mem-gb", default=16.0, show_default=True,
               help="Hard cap on GPU memory used by this process (0 = no cap).")
 @click.option("--seed", default=7, show_default=True)
+@_io_options
+@click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="port,application file adding to or overriding the built-in port names.")
 def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, epochs: int, lr: float, hidden_dim: int, num_layers: int,
-          dropout: float, router_buckets: int, prefix_buckets: int, max_flows_per_window: int | None, chunk_size: int, device: str,
-          max_gpu_mem_gb: float, seed: int) -> None:
+          dropout: float, router_buckets: int, prefix_buckets: int,
+          max_flows_per_window: int | None, chunk_size: int, device: str,
+          max_gpu_mem_gb: float, seed: int, cache_dir: Path | None, workers: int,
+          port_map: Path | None) -> None:
     """Train the GNN on all files in a time window."""
     from netflow_prototype.model import ModelConfig
     from netflow_prototype.train import TrainConfig
@@ -150,6 +170,9 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
                     chunk_size=chunk_size, device=device,
                     max_gpu_mem_gb=max_gpu_mem_gb or None, seed=seed),
         context=context_file(data_dir, fileset.files[0][0], DEFAULT_INTERVAL),
+        cache_dir=cache_dir,
+        workers=workers,
+        port_map=port_map,
     )
     meta = {k: v for k, v in summary["meta"].items() if k != "files"}
     click.echo(json.dumps({"meta": meta, "thresholds": summary["thresholds"]}, indent=2))
@@ -194,18 +217,42 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
               help="Judge route_miles with the model instead of the router-pair baseline.")
 @click.option("--new-flow-burst", default=1000, show_default=True,
               help="First-seen new flows from one ingress in one window that make an anomaly.")
+@_io_options
+@click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="port,application file adding to or overriding the built-in port names.")
+@click.option("--enrich-prefixes", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="PREFIX|ASN|ASN_CUSTOMER|SERVICE|IP_MODE file mapping prefixes to "
+                   "customers and services.")
+@click.option("--burst-tolerant-apps", default="https,http,http-alt,https-alt",
+              show_default=True, help="Applications whose network-wide surges are expected.")
+@click.option("--app-drop-fraction", default=0.2, show_default=True,
+              help="Application below this fraction of its usual bytes is a drop.")
+@click.option("--app-surge-factor", default=5.0, show_default=True,
+              help="Application above this multiple of usual bytes is a surge.")
+@click.option("--app-pair-surge-factor", default=20.0, show_default=True,
+              help="Application on one router pair above this multiple of usual is a surge.")
+@click.option("--pattern-min-share", default=0.5, show_default=True,
+              help="Share of anomalies a value needs to be reported as a pattern...")
+@click.option("--pattern-min-lift", default=2.0, show_default=True,
+              help="...and how much more concentrated than traffic it must be.")
 def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, file_paths: tuple[Path, ...], out_dir: Path,
           labels_dir: Path | None, all_edges: bool, top: int, device: str,
           max_gpu_mem_gb: float, chunk_size: int, write_report: bool, report_max_flows: int,
           flap_window: str, flap_min_change: float, flap_min_miles: float,
           flap_min_reversals: int, miles_min_change: float, miles_min_change_abs: float,
-          no_pair_baseline: bool, new_flow_burst: int) -> None:
+          no_pair_baseline: bool, new_flow_burst: int, cache_dir: Path | None,
+          workers: int, port_map: Path | None, enrich_prefixes: Path | None,
+          burst_tolerant_apps: str, app_drop_fraction: float, app_surge_factor: float,
+          app_pair_surge_factor: float, pattern_min_share: float,
+          pattern_min_lift: float) -> None:
     """Score a new time window (or explicit files) with a trained model."""
     import pandas as pd
 
     from netflow_prototype.infer import infer as run_infer
+    from netflow_prototype.appbaseline import AppRuleConfig
     from netflow_prototype.baselines import PairMilesConfig
+    from netflow_prototype.patterns import PatternConfig
     from netflow_prototype.rules import RuleConfig
 
     _setup_logging(verbose)
@@ -230,14 +277,28 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
                         pair_miles=PairMilesConfig(min_change=miles_min_change,
                                                    min_change_miles=miles_min_change_abs),
                         use_pair_baseline=not no_pair_baseline,
-                        report_max_flows=report_max_flows)
+                        cache_dir=cache_dir, workers=workers,
+                        report_max_flows=report_max_flows, port_map=port_map,
+                        enrich_prefixes_file=enrich_prefixes,
+                        app_rules=AppRuleConfig(
+                            burst_tolerant=tuple(a.strip() for a in
+                                                 burst_tolerant_apps.split(",") if a.strip()),
+                            drop_fraction=app_drop_fraction, surge_factor=app_surge_factor,
+                            pair_surge_factor=app_pair_surge_factor),
+                        patterns_cfg=PatternConfig(min_share=pattern_min_share,
+                                                   min_lift=pattern_min_lift))
 
     windows = pd.read_csv(out_dir / "window_scores.csv")
     click.echo("\nWindows flagged as anomalous:")
     flagged_windows = windows[windows["is_anomalous"]]
     click.echo(flagged_windows[["window", "flows", "flagged_flows", "repeated_violations",
-                                "new_flow_bursts", "max_score"]].to_string(index=False)
-               if len(flagged_windows) else "  none")
+                                "new_flow_bursts", "app_events", "max_score"]]
+               .to_string(index=False) if len(flagged_windows) else "  none")
+
+    patterns = pd.read_csv(out_dir / "anomaly_patterns.csv")
+    found = patterns[(patterns["scope"] == "all windows") & patterns["is_pattern"]]
+    click.echo("\nPatterns across all windows:")
+    click.echo("\n".join(f"  - {s}" for s in found["statement"]) if len(found) else "  none")
 
     edges = pd.read_csv(out_dir / "edge_anomalies.csv")
     click.echo(f"\nTop {min(top, len(edges))} anomalous flows:")
@@ -249,24 +310,79 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
     click.echo("\n" + json.dumps(summary, indent=2, default=str))
 
 
-@main.command("pair-baseline")
+@main.command()
 @_window_options
-@click.option("--model-dir", "-m", required=True,
-              type=click.Path(exists=True, file_okay=False, path_type=Path),
-              help="Model folder to add pair_baseline.csv to.")
-@click.option("--workers", default=4, show_default=True, help="Files read in parallel.")
-def pair_baseline(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
-                  model_dir: Path, workers: int) -> None:
-    """Measure each router pair's usual route_miles from files (no training)."""
-    from netflow_prototype import baselines
+@click.option("--cache-dir", required=True, type=click.Path(file_okay=False, path_type=Path),
+              envvar="NETFLOW_CACHE_DIR", show_envvar=True,
+              help="Where parsed exports are stored.")
+@click.option("--workers", default=8, show_default=True, help="Exports parsed in parallel.")
+def prepare(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
+            cache_dir: Path, workers: int) -> None:
+    """Parse exports once into the flow cache (only new or changed files)."""
+    from netflow_prototype.cache import prepare as run_prepare
 
     _setup_logging(verbose)
     fileset = _resolve(data_dir, start, end, duration)
-    table = baselines.build_from_files(fileset.paths, workers=workers)
-    path = baselines.save(table, model_dir)
-    stable = int((table["high_miles"] - table["low_miles"] <= 1.0).sum())
-    click.echo(json.dumps({"pairs": len(table), "pairs_with_one_distance": stable,
-                           "file": str(path)}, indent=2))
+
+    def progress(done: int, total: int) -> None:
+        if done % 25 == 0 or done == total:
+            logger.info("Prepared %d/%d files", done, total)
+
+    result = run_prepare(fileset.paths, cache_dir, workers=workers, progress=progress)
+    click.echo(json.dumps({
+        "newly_cached": len(result["cached"]),
+        "already_cached": len(result["fresh"]),
+        "skipped_unreadable": result["skipped"],
+        "missing_windows": len(fileset.missing),
+        "cache_dir": str(cache_dir),
+    }, indent=2))
+
+
+def _build_baselines(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
+                     model_dir: Path, cache_dir: Path | None, workers: int,
+                     port_map: Path | None) -> None:
+    from netflow_prototype import baselines
+    from netflow_prototype.enrich import load_port_map, save_port_overrides
+
+    _setup_logging(verbose)
+    fileset = _resolve(data_dir, start, end, duration)
+    built = baselines.build_from_files(fileset.paths, load_port_map(port_map),
+                                       workers=workers, cache_dir=cache_dir)
+    counts = built.save(model_dir)
+    save_port_overrides(port_map, model_dir)
+    click.echo(json.dumps({**counts, "windows": len(built.apps.windows),
+                           "model_dir": str(model_dir)}, indent=2))
+
+
+@main.command("baselines")
+@_window_options
+@click.option("--model-dir", "-m", required=True,
+              type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Model folder to write the baselines to.")
+@_io_options
+@click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="port,application file adding to or overriding the built-in port names.")
+def build_baselines(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
+                    model_dir: Path, cache_dir: Path | None, workers: int,
+                    port_map: Path | None) -> None:
+    """Measure router-pair route_miles and application byte baselines from files (no training)."""
+    _build_baselines(data_dir, start, end, duration, verbose, model_dir, cache_dir, workers,
+                     port_map)
+
+
+@main.command("pair-baseline", hidden=True)
+@_window_options
+@click.option("--model-dir", "-m", required=True,
+              type=click.Path(exists=True, file_okay=False, path_type=Path))
+@_io_options
+@click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="port,application file adding to or overriding the built-in port names.")
+def pair_baseline(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
+                  model_dir: Path, cache_dir: Path | None, workers: int,
+                  port_map: Path | None) -> None:
+    """Alias of the baselines command."""
+    _build_baselines(data_dir, start, end, duration, verbose, model_dir, cache_dir, workers,
+                     port_map)
 
 
 @main.command()

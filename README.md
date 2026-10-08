@@ -71,17 +71,60 @@ Reasons read `route_miles 896.3 vs usual 311.8 for this router pair (range 310.2
 Pairs seen in fewer than 3 windows fall back to the model; `--no-pair-baseline`
 turns the baseline off.
 
-`train` writes the baseline automatically. For an existing model, build it from
-files without retraining (reads files in parallel):
+`train` writes the baseline automatically. For an existing model, build it (and
+the application baselines below) from files without retraining:
 
 ```bash
-python -m netflow_prototype pair-baseline -d /data1/netflow-data-for-ai -s "2026-10-04 00:00" -e "2026-10-06 00:00" -m models/2day --workers 8
+python -m netflow_prototype baselines -d /data1/netflow-data-for-ai -s "2026-10-04 00:00" -e "2026-10-06 00:00" -m models/2day --workers 8
 ```
 
 Without it, the model predicted route_miles from hashed router IDs; with about
 2,750 routers in 1,024 hash slots, distinct pairs blurred together (a pair
 always at 460.6 miles was "expected" at 136). New models use 8,192 router slots
 (`--router-buckets`).
+
+### Enrichment, application baselines and patterns
+
+**Applications from ports.** Every flow gets an `application` from its dstPort
+(22 `ssh`, 53 `dns`, 443 `https`, 3389 `rdp`, about 90 well-known ports; `any`
+for `*`; `other-well-known` / `other-registered` / `other-dynamic` otherwise).
+`--port-map ports.csv` (columns `port,application`) adds or overrides names; pass
+it to `train`/`baselines` and it is saved with the model so inference matches.
+
+**Customers and services from prefixes.** `infer --enrich-prefixes prefixes.txt`
+reads a pipe-delimited file with the header `PREFIX|ASN|ASN_CUSTOMER|SERVICE|IP_MODE`
+and matches each flow's source and destination prefix to the most specific file
+prefix containing it (IPv4 and IPv6; several SERVICE rows for one prefix are joined
+with `;`). Flows get `src_*`/`dst_*` ASN, customer and service, plus a flow-level
+`customer` and `service` taken from the side with a known customer (source first).
+
+**Application baselines** (`app_baseline.csv`, `app_pair_baseline.csv`, written by
+`train` or the `baselines` command) record each application's usual bytes per
+window, overall and by hour of day, and on each router pair. Rules are asymmetric:
+
+| Event | Rule (defaults) |
+|---|---|
+| `application_disappeared` / `application_drop` | An application normally present (90% of windows) vanishes or falls below 20% of usual (`--app-drop-fraction`). Example: DNS disappearing. |
+| `application_surge` | Above 5x usual and its 99th percentile (`--app-surge-factor`), **except** burst-tolerant applications (`--burst-tolerant-apps`, default https, http, http-alt, https-alt), whose bursts are expected. |
+| `app_pair_surge` | Any application, https included, on one router pair above 20x its usual bytes and 4 standard deviations (`--app-pair-surge-factor`). |
+| `app_pair_disappeared` / `app_pair_drop` | An application normally on a router pair (95% of windows, 5+ flows on average) vanishes or falls below 10%. |
+
+**Patterns.** Anomalous flows and application-pair events are clustered per window
+and across the run by router pair, ingress, egress, application, service and
+customer. Each dimension's top value is listed with its share of the anomalies, its
+share of all traffic and the ratio of the two (lift); it is a pattern when the share
+is at least 50% and the lift at least 2 (`--pattern-min-share`, `--pattern-min-lift`),
+so "most anomalies are https" is not reported when most traffic is https. Example:
+`94% of 18 anomalies leave at egress router SITEA401CR1 (0.6% of flows)`.
+
+On the synthetic benchmark, 39 of the 41 windows with patterns contained an injected
+anomaly, and the pattern named the affected egress router or router pair; 26 of 27
+application events fell in injected windows.
+
+```bash
+python -m netflow_prototype baselines -d /data1/netflow-data-for-ai -s "2026-10-04 00:00" -e "2026-10-06 00:00" -m models/2day --workers 8
+python -m netflow_prototype infer -m models/2day -f /data1/netflow-data-for-ai/netflow.20261007.16.00.txt.gz -o results/1007 --enrich-prefixes prefixes.txt --report --device cuda
+```
 
 ### Rules on top of the model
 
@@ -128,6 +171,30 @@ window is loaded only to provide lag features. On real servers, point
 
 Useful training options: `--epochs`, `--hidden-dim`, `--num-layers`, `--dropout`,
 `--max-flows-per-window` (random sample for very large files), and `--device cuda|mps`.
+
+### Faster runs: parse exports once
+
+Parsing a gzipped export takes several seconds per window (about 7 s for 2
+million flows). `prepare` parses each export once, in parallel, into a flow
+cache; `train`, `infer` and `pair-baseline` then load windows from it in about
+0.2 s each (two 2-million-flow windows: 11.3 s from raw files, 0.5 s from the cache).
+
+```bash
+# Once, then e.g. hourly or daily: only new or re-delivered exports are parsed
+python -m netflow_prototype prepare -d /data1/netflow-data-for-ai -s "2026-09-22 00:00" -e "2026-10-08 00:00" --cache-dir /data1/netflow-cache --workers 8
+
+# Every command that reads exports accepts the same cache (or set NETFLOW_CACHE_DIR once)
+export NETFLOW_CACHE_DIR=/data1/netflow-cache
+python -m netflow_prototype train -d /data1/netflow-data-for-ai -s "2026-09-22 00:00" --duration 14d -m models/v2 --device cuda
+```
+
+- Commands also read in parallel (`--workers`, default 4) and add any missing
+  cache entries as they go, so `prepare` is optional; it just does the work up front.
+- An entry is reused only while it is newer than its export, so a re-delivered
+  file is parsed again. Damaged exports are reported as `skipped_unreadable`.
+- Size: about half of the raw export (about 40 MB per 2-million-flow window, so
+  about 80 GB for two weeks). Delete old entries freely; they are rebuilt on demand.
+- The cache uses Python pickle: keep the cache directory writable only by trusted users.
 
 ### GPU memory
 
@@ -181,6 +248,9 @@ python -m netflow_prototype visualize -f /data1/netflow-data-for-ai/netflow.2026
 | `results/<name>/node_scores.csv` | Per-router, per-window scores, including new-flow bursts |
 | `results/<name>/window_scores.csv` | Per-window flagged fraction, repeated violations, bursts and verdict |
 | `results/<name>/graph_edges.csv` | The scored graph: one row per window, `a_node` (ingress), `z_node` (egress), with flows, bytes, route_miles, anomalous, repeated and new flows |
+| `results/<name>/app_anomalies.csv` | Application and application-on-router-pair events: kind, bytes vs usual, reason |
+| `results/<name>/anomaly_patterns.csv` | Per window and overall: top value per dimension, share, traffic share, lift, `is_pattern`, statement |
+| `models/<name>/app_baseline.csv`, `app_pair_baseline.csv` | Usual bytes per application (overall and by hour) and per application on each router pair |
 | `results/<name>/anomaly_report.txt` | Readable report grouped by window (with `--report`; `--report-max-flows` per window, default 25) |
 | `results/<name>/edge_scores.csv` | Every scored flow (with `--all-edges`) |
 | `results/<name>/metrics.json` | Evaluation (with `--labels-dir`) |
@@ -245,10 +315,14 @@ netflow-prototype/
     infer.py       # scoring, router/window aggregation, evaluation
     rules.py       # repeated violations, new flows and bursts, baselines, graph table
     baselines.py   # router-pair route_miles baseline
+    cache.py       # parsed-export cache (prepare command)
+    enrich.py      # dstPort -> application; prefix -> ASN, customer, service
+    appbaseline.py # application byte baselines and application rules
+    patterns.py    # cluster anomalies into patterns
     report.py      # readable anomaly_report.txt
     synthetic.py   # synthetic data in the production schema, with labels
     visualize.py   # draw a window's router graph as an image
-    cli.py         # generate / files / train / pair-baseline / infer / visualize
+    cli.py         # generate / files / prepare / train / baselines / infer / visualize
   tests/           # pytest suite (python -m pytest)
   requirements.txt
 ```

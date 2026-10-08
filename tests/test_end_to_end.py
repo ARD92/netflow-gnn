@@ -18,7 +18,8 @@ def test_generate_train_infer(tmp_path):
     assert len(list(data.glob("netflow.*.txt.gz"))) == 24
 
     res = runner.invoke(main, ["train", "-d", str(data), "-s", "2026-10-04 00:00",
-                               "--duration", "3h", "-m", str(model), "--epochs", "3"])
+                               "--duration", "3h", "-m", str(model), "--epochs", "3",
+                               "--cache-dir", str(tmp_path / "cache"), "--workers", "2"])
     assert res.exit_code == 0, res.output
     assert (model / "model.pt").exists()
     assert (model / "pair_baseline.csv").exists()
@@ -27,7 +28,8 @@ def test_generate_train_infer(tmp_path):
 
     res = runner.invoke(main, ["infer", "-m", str(model), "-d", str(data),
                                "-s", "2026-10-04 03:00", "-e", "2026-10-04 04:00",
-                               "-o", str(out), "--labels-dir", str(data / "labels")])
+                               "-o", str(out), "--labels-dir", str(data / "labels"),
+                               "--cache-dir", str(tmp_path / "cache")])
     assert res.exit_code == 0, res.output
     windows = pd.read_csv(out / "window_scores.csv")
     assert len(windows) == 6

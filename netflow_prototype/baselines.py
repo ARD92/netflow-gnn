@@ -80,23 +80,64 @@ class PairBaselineBuilder:
         return out.reset_index(drop=True)
 
 
-def _summarize_file(path: str) -> pd.DataFrame | None:
+class WindowBaselines:
+    """Builds every file-derived baseline (router pairs, applications) in one pass."""
+
+    def __init__(self, ports: dict[int, str]) -> None:
+        from netflow_prototype.appbaseline import AppBaselineBuilder
+
+        self.ports = ports
+        self.pairs = PairBaselineBuilder()
+        self.apps = AppBaselineBuilder()
+
+    def __call__(self, ts, flows: pd.DataFrame) -> None:
+        """Observer for ``load_graphs``: summarize one full window."""
+        from netflow_prototype.appbaseline import app_summaries
+
+        self.add(ts, pair_summary(flows), *app_summaries(flows, self.ports))
+
+    def add(self, ts, pairs: pd.DataFrame, app_totals: pd.DataFrame,
+            app_pairs: pd.DataFrame) -> None:
+        self.pairs.add(pairs)
+        self.apps.add(ts, app_totals, app_pairs)
+
+    def save(self, model_dir: str | Path) -> dict[str, int]:
+        from netflow_prototype import appbaseline
+
+        pair_table = self.pairs.build()
+        save(pair_table, model_dir)
+        apps, app_pairs = self.apps.build()
+        appbaseline.save(apps, app_pairs, model_dir)
+        return {"router_pairs": len(pair_table),
+                "applications": int((apps["hour"] == -1).sum()) if len(apps) else 0,
+                "application_router_pairs": len(app_pairs)}
+
+
+def _summarize_file(path: str, cache_dir: str | None, ports: dict[int, str]):
+    from netflow_prototype.appbaseline import app_summaries
     from netflow_prototype.data import _safe_load  # local import: runs in worker processes
+    from netflow_prototype.windows import file_timestamp
 
-    flows = _safe_load(Path(path))
-    return None if flows is None else pair_summary(flows)
+    flows = _safe_load(Path(path), cache_dir)
+    if flows is None:
+        return None
+    return (file_timestamp(Path(path)), pair_summary(flows), *app_summaries(flows, ports))
 
 
-def build_from_files(paths: list[Path], workers: int = 4) -> pd.DataFrame:
-    """Build the pair baseline by reading files in parallel (no model involved)."""
-    builder = PairBaselineBuilder()
+def build_from_files(paths: list[Path], ports: dict[int, str], workers: int = 4,
+                     cache_dir: str | Path | None = None) -> WindowBaselines:
+    """Build pair and application baselines by reading files in parallel (no model)."""
+    result = WindowBaselines(ports)
+    n = len(paths)
     with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
-        for i, summary in enumerate(pool.map(_summarize_file, map(str, paths)), start=1):
+        summaries = pool.map(_summarize_file, map(str, paths),
+                             [None if cache_dir is None else str(cache_dir)] * n, [ports] * n)
+        for i, summary in enumerate(summaries, start=1):
             if summary is not None:
-                builder.add(summary)
-            if i % 10 == 0 or i == len(paths):
-                logger.info("Pair baseline: %d/%d files read", i, len(paths))
-    return builder.build()
+                result.add(*summary)
+            if i % 10 == 0 or i == n:
+                logger.info("Baselines: %d/%d files read", i, n)
+    return result
 
 
 def save(table: pd.DataFrame, model_dir: str | Path) -> Path:

@@ -74,5 +74,8 @@ def test_pair_baseline_command(tmp_path):
     assert res.exit_code == 0, res.output
     summary = json.loads(res.output)
     table = pd.read_csv(model / "pair_baseline.csv")
-    assert summary["pairs"] == len(table) > 0
+    assert summary["router_pairs"] == len(table) > 0
     assert (table["windows"] == 6).mean() > 0.5
+    apps = pd.read_csv(model / "app_baseline.csv")
+    assert {"https", "dns"} <= set(apps["application"]) and summary["applications"] > 0
+    assert (model / "app_pair_baseline.csv").exists()
