@@ -32,6 +32,12 @@ PREFIX_FILE = """PREFIX|ASN|ASN_CUSTOMER|SERVICE|IP_MODE
 """
 
 
+def test_5g_ports_are_named():
+    ports = pd.Series(["2152", "2123", "8805", "38412", "36412", "3868", "38472"])
+    assert list(applications(ports, PORT_APPLICATIONS)) == [
+        "gtp-u", "gtp-c", "pfcp", "ngap", "s1ap", "diameter", "f1ap"]
+
+
 def test_port_applications_and_overrides(tmp_path):
     ports = pd.Series(["22", "443", "53", "*", "771", "30000", "60000", "9999"])
     assert list(applications(ports, PORT_APPLICATIONS)) == [
@@ -72,12 +78,14 @@ def test_flow_customer_uses_the_known_side(tmp_path):
 T0 = datetime(2026, 10, 6, 10, 0)
 
 
-def _window(dns_bytes=1e6, https_bytes=1e8, pair_https=None, dns=True):
+def _window(dns_bytes=1e6, https_bytes=1e8, pair_https=None, dns=True, any_port=True):
     rows = []
     for i in range(10):
         rows.append(("PE-A", "PE-B", f"10.0.{i}.0/24", "443", https_bytes / 10))
         if dns:
             rows.append(("PE-A", "PE-C", f"10.0.{i}.0/24", "53", dns_bytes / 10))
+        if any_port:
+            rows.append(("PE-D", "PE-E", f"10.1.{i}.0/24", "*", 5e6))
     if pair_https is not None:
         rows.append(("PE-X", "PE-Y", "10.9.0.0/24", "443", pair_https))
     return pd.DataFrame(rows, columns=["ingress", "egress", "srcIpPrefix", "dstPort", "bytes"])
@@ -143,3 +151,26 @@ def test_patterns_find_concentration_not_volume():
     app = pats.loc[("all windows", "application")]
     assert app["value"] == "https" and app["lift"] < 2.0
     assert not app["is_pattern"]  # https anomalies just follow where the traffic is
+
+
+def test_untyped_any_traffic_is_never_judged():
+    events = _events(_window(any_port=False, pair_https=1e6))
+    assert not (events["application"] == "any").any()   # '*' vanished: no events
+    assert events.empty
+
+
+def test_only_tracked_applications_get_drop_rules():
+    cfg = AppRuleConfig(pair_min_windows=5, tracked=("ntp",))
+    events = _events(_window(dns=False, pair_https=1e6), cfg)
+    assert events.empty  # DNS vanished but is not tracked in this configuration
+
+
+def test_port_map_drift(tmp_path):
+    from netflow_prototype.enrich import port_map_drift, save_port_map
+
+    assert port_map_drift(tmp_path) is None  # no saved map: older baselines
+    old = {p: a for p, a in PORT_APPLICATIONS.items() if a not in ("gtp-u", "pfcp")}
+    save_port_map(old, tmp_path)
+    assert port_map_drift(tmp_path) == ["gtp-u", "pfcp"]
+    save_port_map(PORT_APPLICATIONS, tmp_path)
+    assert port_map_drift(tmp_path) == []

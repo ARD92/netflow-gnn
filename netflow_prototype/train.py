@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from netflow_prototype.baselines import WindowBaselines
-from netflow_prototype.enrich import load_port_map, save_port_overrides
+from netflow_prototype.enrich import load_port_map, save_port_map
 from netflow_prototype.data import load_graphs
 from netflow_prototype.graph import FeatureStats, WindowGraph
 from netflow_prototype.model import (
@@ -208,7 +208,7 @@ def train(
 
     seen = np.unique(np.concatenate([g.flow_hash for g in graphs]))
     np.save(model_dir / SEEN_FLOWS_NAME, seen)
-    save_port_overrides(port_map, model_dir)
+    save_port_map(load_port_map(port_map), model_dir)
     logger.info("Baselines: %s", window_baselines.save(model_dir))
 
     meta = {

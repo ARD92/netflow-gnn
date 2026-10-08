@@ -86,10 +86,17 @@ always at 460.6 miles was "expected" at 136). New models use 8,192 router slots
 ### Enrichment, application baselines and patterns
 
 **Applications from ports.** Every flow gets an `application` from its dstPort
-(22 `ssh`, 53 `dns`, 443 `https`, 3389 `rdp`, about 90 well-known ports; `any`
+(22 `ssh`, 53 `dns`, 443 `https`, 3389 `rdp`, about 100 well-known ports; `any`
 for `*`; `other-well-known` / `other-registered` / `other-dynamic` otherwise).
-`--port-map ports.csv` (columns `port,application`) adds or overrides names; pass
-it to `train`/`baselines` and it is saved with the model so inference matches.
+3GPP mobile core and RAN ports are included: `gtp-u` 2152 (N3/N9, S1-U), `gtp-c`
+2123 (S11/S5/S8, N26), `gtp-prime` 3386, `pfcp` 8805 (N4 SMF-UPF), `ngap` 38412 (N2
+gNB-AMF), `xnap` 38422, `e1ap` 38462, `f1ap` 38472, `s1ap` 36412, `x2ap` 36422,
+`diameter` 3868 and `diameter-tls` 5868. 5G service-based interfaces (AMF, SMF, NRF,
+... over HTTP/2) have no standard port: map your deployment's SBI ports with
+`--port-map ports.csv` (columns `port,application`), which adds or overrides names.
+`train`/`baselines` save the full port map with the model (`port_map.csv`) and
+inference uses it, so labels match the baselines; rebuild baselines after the port
+list changes (inference logs a warning when it is out of date).
 
 **Customers and services from prefixes.** `infer --enrich-prefixes prefixes.txt`
 reads a pipe-delimited file with the header `PREFIX|ASN|ASN_CUSTOMER|SERVICE|IP_MODE`
@@ -104,10 +111,16 @@ window, overall and by hour of day, and on each router pair. Rules are asymmetri
 
 | Event | Rule (defaults) |
 |---|---|
-| `application_disappeared` / `application_drop` | An application normally present (90% of windows) vanishes or falls below 20% of usual (`--app-drop-fraction`). Example: DNS disappearing. |
-| `application_surge` | Above 5x usual and its 99th percentile (`--app-surge-factor`), **except** burst-tolerant applications (`--burst-tolerant-apps`, default https, http, http-alt, https-alt), whose bursts are expected. |
-| `app_pair_surge` | Any application, https included, on one router pair above 20x its usual bytes and 4 standard deviations (`--app-pair-surge-factor`). |
-| `app_pair_disappeared` / `app_pair_drop` | An application normally on a router pair (95% of windows, 5+ flows on average) vanishes or falls below 10%. |
+| `application_disappeared` / `application_drop` | A **tracked** application normally present (90% of windows) vanishes or falls below 20% of usual (`--app-drop-fraction`). Example: DNS disappearing. |
+| `application_surge` | Above 5x usual and its 99th percentile (`--app-surge-factor`), **except** burst-tolerant applications (`--burst-tolerant-apps`, default https, http, http-alt, https-alt, gtp-u), whose bursts are expected. |
+| `app_pair_surge` | Any typed application, https included, on one router pair above 20x its usual bytes and 4 standard deviations (`--app-pair-surge-factor`). |
+| `app_pair_disappeared` / `app_pair_drop` | A **tracked** application normally on a router pair (95% of windows, 5+ flows on average) vanishes or falls below 10%. |
+
+Tracked applications (`--tracked-apps`) default to critical infrastructure and mobile
+core: dns, dns-over-tls, ntp, dhcp, radius, diameter, ldap, kerberos, bgp, sip, gtp-c,
+gtp-u, pfcp, ngap, xnap, e1ap, f1ap, s1ap, x2ap. Untyped traffic (`any` for dstPort `*`
+and the `other-*` buckets) mixes unrelated flows and is never judged by application
+rules; it is still scored per flow by the model.
 
 **Patterns.** Anomalous flows and application-pair events are clustered per window
 and across the run by router pair, ingress, egress, application, service and

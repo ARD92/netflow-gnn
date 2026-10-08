@@ -223,7 +223,11 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
 @click.option("--enrich-prefixes", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="PREFIX|ASN|ASN_CUSTOMER|SERVICE|IP_MODE file mapping prefixes to "
                    "customers and services.")
-@click.option("--burst-tolerant-apps", default="https,http,http-alt,https-alt",
+@click.option("--tracked-apps", default=None,
+              help="Comma-separated applications whose drop or disappearance is an anomaly "
+                   "(default: DNS, NTP, DHCP, RADIUS, Diameter, LDAP, Kerberos, BGP, SIP, "
+                   "GTP-C/U, PFCP, NGAP, XnAP, E1AP, F1AP, S1AP, X2AP).")
+@click.option("--burst-tolerant-apps", default="https,http,http-alt,https-alt,gtp-u",
               show_default=True, help="Applications whose network-wide surges are expected.")
 @click.option("--app-drop-fraction", default=0.2, show_default=True,
               help="Application below this fraction of its usual bytes is a drop.")
@@ -243,7 +247,7 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           flap_min_reversals: int, miles_min_change: float, miles_min_change_abs: float,
           no_pair_baseline: bool, new_flow_burst: int, cache_dir: Path | None,
           workers: int, port_map: Path | None, enrich_prefixes: Path | None,
-          burst_tolerant_apps: str, app_drop_fraction: float, app_surge_factor: float,
+          tracked_apps: str | None, burst_tolerant_apps: str, app_drop_fraction: float, app_surge_factor: float,
           app_pair_surge_factor: float, pattern_min_share: float,
           pattern_min_lift: float) -> None:
     """Score a new time window (or explicit files) with a trained model."""
@@ -281,6 +285,8 @@ def infer(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
                         report_max_flows=report_max_flows, port_map=port_map,
                         enrich_prefixes_file=enrich_prefixes,
                         app_rules=AppRuleConfig(
+                            **({"tracked": tuple(a.strip() for a in tracked_apps.split(",")
+                                                 if a.strip())} if tracked_apps else {}),
                             burst_tolerant=tuple(a.strip() for a in
                                                  burst_tolerant_apps.split(",") if a.strip()),
                             drop_fraction=app_drop_fraction, surge_factor=app_surge_factor,
@@ -342,14 +348,14 @@ def _build_baselines(data_dir: Path, start: str, end: str, duration: str, verbos
                      model_dir: Path, cache_dir: Path | None, workers: int,
                      port_map: Path | None) -> None:
     from netflow_prototype import baselines
-    from netflow_prototype.enrich import load_port_map, save_port_overrides
+    from netflow_prototype.enrich import load_port_map, save_port_map
 
     _setup_logging(verbose)
     fileset = _resolve(data_dir, start, end, duration)
     built = baselines.build_from_files(fileset.paths, load_port_map(port_map),
                                        workers=workers, cache_dir=cache_dir)
     counts = built.save(model_dir)
-    save_port_overrides(port_map, model_dir)
+    save_port_map(load_port_map(port_map), model_dir)
     click.echo(json.dumps({**counts, "windows": len(built.apps.windows),
                            "model_dir": str(model_dir)}, indent=2))
 

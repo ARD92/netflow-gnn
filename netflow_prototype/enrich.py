@@ -41,36 +41,75 @@ PORT_APPLICATIONS: dict[int, str] = {
     5672: "amqp", 5900: "vnc", 6379: "redis", 6443: "kubernetes-api", 8080: "http-alt",
     8443: "https-alt", 8883: "mqtts", 9092: "kafka", 9200: "elasticsearch",
     11211: "memcached", 27017: "mongodb",
+    # 3GPP mobile core and RAN (4G/5G). SCTP-based protocols appear with their SCTP port.
+    2123: "gtp-c",          # GTPv2-C: S11/S5/S8, N26 (AMF<->MME)
+    2152: "gtp-u",          # GTP-U user plane: N3/N9 (gNB<->UPF), S1-U, S5-U
+    3386: "gtp-prime",      # GTP' charging data
+    8805: "pfcp",           # N4: SMF<->UPF session control
+    38412: "ngap",          # N2: gNB<->AMF (SCTP)
+    38422: "xnap",          # Xn: gNB<->gNB (SCTP)
+    38462: "e1ap",          # E1: gNB-CU-CP<->CU-UP (SCTP)
+    38472: "f1ap",          # F1: gNB-CU<->DU (SCTP)
+    36412: "s1ap",          # S1-MME: eNB<->MME (SCTP)
+    36422: "x2ap",          # X2: eNB<->eNB (SCTP)
+    3868: "diameter",       # Gx/Rx/S6a/... policy, charging, subscriber data
+    5868: "diameter-tls",
+    # 5G service-based interfaces (AMF, SMF, NRF, UDM, ... over HTTP/2) have no
+    # standard port; map your deployment's SBI ports with --port-map.
 }
 
+# Applications whose drop or disappearance is an anomaly (critical infrastructure).
+TRACKED_APPLICATIONS: tuple[str, ...] = (
+    "dns", "dns-over-tls", "ntp", "dhcp", "radius", "radius-acct", "diameter",
+    "diameter-tls", "ldap", "ldaps", "kerberos", "bgp", "sip", "sips",
+    "gtp-c", "gtp-u", "pfcp", "ngap", "xnap", "e1ap", "f1ap", "s1ap", "x2ap",
+)
+# Buckets of unrelated traffic: never judged as an application.
+UNTYPED_APPLICATIONS: tuple[str, ...] = (
+    "any", "other-well-known", "other-registered", "other-dynamic",
+)
 
-def load_port_map(path: str | Path | None) -> dict[int, str]:
-    """Built-in port map plus overrides from a ``port,application`` file."""
-    ports = dict(PORT_APPLICATIONS)
-    if path is None:
-        return ports
+
+def _read_port_file(path: str | Path) -> dict[int, str]:
     table = pd.read_csv(path, sep=None, engine="python", dtype=str, keep_default_na=False)
     table.columns = [c.strip().lower() for c in table.columns]
     if not {"port", "application"} <= set(table.columns):
         raise ValueError(f"{path}: needs 'port' and 'application' columns")
-    for port, app in zip(table["port"], table["application"], strict=True):
-        ports[int(port)] = app.strip()
+    return {int(p): a.strip() for p, a in zip(table["port"], table["application"], strict=True)}
+
+
+def load_port_map(path: str | Path | None) -> dict[int, str]:
+    """Built-in port map plus additions/overrides from a ``port,application`` file."""
+    ports = dict(PORT_APPLICATIONS)
+    if path is not None:
+        ports.update(_read_port_file(path))
     return ports
 
 
-def save_port_overrides(path_in: str | Path | None, model_dir: str | Path) -> None:
-    """Keep the port file used for the baselines with the model, so inference matches it."""
-    if path_in is not None:
-        target = Path(model_dir) / "port_map.csv"
-        target.write_text(Path(path_in).read_text())
+PORT_MAP_NAME = "port_map.csv"
+
+
+def save_port_map(ports: dict[int, str], model_dir: str | Path) -> None:
+    """Save the full port map the baselines were built with, so inference labels match."""
+    pd.DataFrame(sorted(ports.items()), columns=["port", "application"]).to_csv(
+        Path(model_dir) / PORT_MAP_NAME, index=False)
 
 
 def model_port_map(model_dir: str | Path, override: str | Path | None = None) -> dict[int, str]:
     """Port map for a model: explicit file, else the one saved with the model, else built-in."""
     if override is not None:
         return load_port_map(override)
-    saved = Path(model_dir) / "port_map.csv"
-    return load_port_map(saved if saved.exists() else None)
+    saved = Path(model_dir) / PORT_MAP_NAME  # exactly the map the baselines were built with
+    return _read_port_file(saved) if saved.exists() else dict(PORT_APPLICATIONS)
+
+
+def port_map_drift(model_dir: str | Path) -> list[str] | None:
+    """Built-in applications missing from the model's saved port map (None: none saved)."""
+    saved = Path(model_dir) / PORT_MAP_NAME
+    if not saved.exists():
+        return None
+    known = set(_read_port_file(saved).values())
+    return sorted(set(PORT_APPLICATIONS.values()) - known)
 
 
 def _application(port: str, ports: dict[int, str]) -> str:

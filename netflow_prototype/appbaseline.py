@@ -8,18 +8,20 @@ Two baselines are measured from the training (or baseline) window:
 - Per application on each router pair: statistics of log(bytes) over the
   windows where it appears, plus how often it appears.
 
-Rules (asymmetric on purpose):
+Rules (asymmetric on purpose). Untyped buckets (``any`` for dstPort ``*`` and
+``other-*``) mix unrelated traffic and are never judged.
 
-- An application that is normally always present (default: in 90% of
-  windows) and drops below 20% of its usual bytes is ``application_drop``;
-  if it vanishes entirely it is ``application_disappeared`` (for example DNS).
+- A tracked critical application (DNS, NTP, RADIUS, Diameter, BGP, GTP, PFCP,
+  NGAP, ...; ``tracked``) that is normally always present (default: in 90%
+  of windows) and drops below 20% of its usual bytes is ``application_drop``;
+  if it vanishes entirely it is ``application_disappeared``.
 - A surge above 5x usual (and above its 99th percentile) is
   ``application_surge``, except for burst-tolerant applications (https, http,
   ...), whose bursts are expected.
 - On a single router pair, any application, https included, above 20x its
   usual bytes (and 4 standard deviations in log space) is ``app_pair_surge``.
-- An application that is on a router pair in almost every window (95%, seen in
-  12+ windows) with several flows each time (5+ on average) and drops below
+- A tracked application that is on a router pair in almost every window (95%,
+  seen in 12+ windows) with several flows each time (5+ on average) and drops below
   10% or vanishes is ``app_pair_drop`` / ``app_pair_disappeared``. Pairs
   carried by one or two flows are left to the flow-level model: one flow
   pausing would otherwise look like the application vanishing.
@@ -34,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from netflow_prototype.enrich import applications
+from netflow_prototype.enrich import TRACKED_APPLICATIONS, UNTYPED_APPLICATIONS, applications
 
 APP_BASELINE_NAME = "app_baseline.csv"
 APP_PAIR_BASELINE_NAME = "app_pair_baseline.csv"
@@ -46,7 +48,9 @@ EVENT_COLUMNS = ["window", "level", "kind", "application", "ingress", "egress", 
 
 @dataclass
 class AppRuleConfig:
-    burst_tolerant: tuple[str, ...] = ("https", "http", "http-alt", "https-alt")
+    tracked: tuple[str, ...] = TRACKED_APPLICATIONS       # drop/disappear rules apply
+    burst_tolerant: tuple[str, ...] = ("https", "http", "http-alt", "https-alt", "gtp-u")
+    untyped: tuple[str, ...] = UNTYPED_APPLICATIONS       # never judged
     regular_presence: float = 0.9
     drop_fraction: float = 0.2
     surge_factor: float = 5.0
@@ -195,7 +199,10 @@ def detect_app_events(edges: pd.DataFrame, ts: datetime, base: AppBaseline,
         common = {"window": ts, "level": "application", "application": app,
                   "ingress": "", "egress": "", "bytes": cur_bytes, "usual_bytes": usual,
                   "ratio": cur_bytes / usual if usual > 0 else np.nan, "flows": cur_flows}
-        regular = overall.loc[app, "presence"] >= cfg.regular_presence and usual > 0
+        if app in cfg.untyped:
+            continue
+        regular = (app in cfg.tracked and overall.loc[app, "presence"] >= cfg.regular_presence
+                   and usual > 0)
         if regular and cur_flows == 0:
             events.append({**common, "kind": "application_disappeared",
                            "reason": f"{app} traffic disappeared (usually {_fmt(usual)} bytes)"})
@@ -217,7 +224,8 @@ def detect_app_events(edges: pd.DataFrame, ts: datetime, base: AppBaseline,
     std = np.maximum(joined["std_log_bytes"].fillna(0).to_numpy(), cfg.pair_min_std)
     z = (log_b - joined["mean_log_bytes"].fillna(0).to_numpy()) / std
     usual = np.expm1(joined["mean_log_bytes"].fillna(0).to_numpy())
-    surge = seen.to_numpy() & (z >= cfg.pair_surge_z) & (
+    typed = ~joined.index.get_level_values("application").isin(cfg.untyped)
+    surge = seen.to_numpy() & typed & (z >= cfg.pair_surge_z) & (
         joined["sum"].to_numpy() >= cfg.pair_surge_factor * usual)
     for (app, ing, egr), row, u in zip(joined.index[surge], joined[surge].itertuples(),
                                        usual[surge], strict=True):
@@ -230,7 +238,9 @@ def detect_app_events(edges: pd.DataFrame, ts: datetime, base: AppBaseline,
 
     mean_flows = (base.pairs["mean_flows"] if "mean_flows" in base.pairs.columns
                   else pd.Series(np.inf, index=base.pairs.index))
-    regular_pairs = base.pairs[(base.pairs["presence"] >= cfg.pair_regular_presence)
+    tracked = base.pairs.index.get_level_values("application").isin(cfg.tracked)
+    regular_pairs = base.pairs[tracked
+                               & (base.pairs["presence"] >= cfg.pair_regular_presence)
                                & (base.pairs["windows"] >= cfg.pair_min_windows)
                                & (mean_flows >= cfg.pair_min_flows)]
     if len(regular_pairs):

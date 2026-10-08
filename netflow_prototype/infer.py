@@ -28,7 +28,13 @@ import torch
 
 from netflow_prototype import baselines
 from netflow_prototype.appbaseline import EVENT_COLUMNS, AppBaseline, AppRuleConfig, detect_app_events
-from netflow_prototype.enrich import PrefixEnricher, applications, enrich_prefixes, model_port_map
+from netflow_prototype.enrich import (
+    PrefixEnricher,
+    applications,
+    enrich_prefixes,
+    model_port_map,
+    port_map_drift,
+)
 from netflow_prototype.patterns import PatternConfig, find_patterns
 from netflow_prototype.baselines import PairMilesConfig, apply_pair_baseline
 from netflow_prototype.data import load_graphs
@@ -369,6 +375,15 @@ def infer(
 
     # Enrichment: application from dstPort; customer/service from prefixes (optional).
     edges["application"] = applications(edges["dstPort"], model_port_map(model_dir, port_map))
+    drift = None if port_map else port_map_drift(model_dir)
+    if drift is None and not port_map:
+        logger.warning("Baselines in %s predate saved port maps; rebuild them with the "
+                       "baselines command so newer applications (e.g. gtp-u, pfcp, ngap) "
+                       "get baselines.", model_dir)
+    elif drift:
+        logger.warning("Applications added since the baselines were built are labeled with "
+                       "the old port list (%s); rebuild with the baselines command.",
+                       ", ".join(drift[:8]))
     if enrich_prefixes_file:
         enricher = PrefixEnricher.from_file(enrich_prefixes_file)
         logger.info("Enriching prefixes from %s (%d prefixes)", enrich_prefixes_file,
