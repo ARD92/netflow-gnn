@@ -332,7 +332,11 @@ def infer(
         files, warmup = [context, *files], context[0]
     graphs = load_graphs(files, lm.config.hashes, keep_flows=True, context_flows=baseline,
                          cache_dir=cache_dir, workers=workers)
-    scored: list[pd.DataFrame] = []
+    
+    scored_history = []
+    out_edges = []
+    out_bursts = []
+    
     prev_ts, prev_flagged = None, np.zeros(0, dtype=np.uint64)
     # Last normal (unflagged) observation per flow: [log1p(bytes), route_miles, time].
     last_good = pd.DataFrame({"log_bytes": pd.Series(dtype=float),
@@ -354,8 +358,23 @@ def infer(
             g.prev[rows, 0] = good["log_bytes"].to_numpy(dtype=float)[fresh]
             g.prev[rows, 1] = good["miles"].to_numpy(dtype=float)[fresh]
             g.prev[rows, 2] = 1.0
+            
         df = score_window(lm, g, run, pair_miles)
-        scored.append(df)
+        scored_history.append(df)
+        
+        # Keep only the last `flap_steps + 1` windows to bound memory.
+        if len(scored_history) > rules.flap_steps + 1:
+            scored_history.pop(0)
+            
+        current_edges = pd.concat(scored_history, ignore_index=True)
+        current_edges, current_bursts = apply_rules(current_edges, rules)
+        
+        # We only extract and save the results for the current window being processed
+        latest_edges = current_edges[current_edges["window"] == g.timestamp].copy()
+        latest_bursts = current_bursts[current_bursts["window"] == g.timestamp].copy()
+        out_edges.append(latest_edges)
+        out_bursts.append(latest_bursts)
+        
         ok = ~df["model_flag"].to_numpy()
         update = pd.DataFrame({"log_bytes": np.log1p(df["bytes"].to_numpy()[ok]),
                                "miles": df["route_miles"].to_numpy()[ok],
@@ -363,9 +382,11 @@ def infer(
                               index=pd.Index(g.flow_hash[ok], dtype=np.uint64))
         last_good = pd.concat([last_good[~last_good.index.isin(update.index)], update])
         prev_ts, prev_flagged = g.timestamp, g.flow_hash[~ok]
-    edges = pd.concat(scored, ignore_index=True)
-    edges, bursts = apply_rules(edges, rules)
-    edges = add_baselines(edges, rules)
+        
+    edges = pd.concat(out_edges, ignore_index=True) if out_edges else pd.DataFrame()
+    bursts = pd.concat(out_bursts, ignore_index=True) if out_bursts else pd.DataFrame()
+    if not edges.empty:
+        edges = add_baselines(edges, rules)
     if warmup is not None:
         edges = edges[edges["window"] != warmup].reset_index(drop=True)
         bursts = bursts[bursts["window"] != warmup].reset_index(drop=True)

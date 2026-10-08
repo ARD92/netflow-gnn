@@ -175,13 +175,19 @@ def _node_features(flows: pd.DataFrame, src: np.ndarray, dst: np.ndarray,
 
     # Shannon entropy of raw dstPort usage over incident flows.
     ports = flows["dstPort"].to_numpy()
-    inc = pd.DataFrame({"node": np.concatenate([src, dst]),
-                        "port": np.concatenate([ports, ports])})
-    counts = inc.groupby(["node", "port"]).size()
-    probs = counts / counts.groupby(level="node").transform("sum")
-    entropy_s = (-(probs * np.log2(probs))).groupby(level="node").sum()
-    entropy = np.zeros(n)
-    entropy[entropy_s.index.to_numpy()] = entropy_s.to_numpy()
+    nodes = np.concatenate([src, dst])
+    port_codes, _ = pd.factorize(np.concatenate([ports, ports]))
+    num_ports = max(port_codes.max() + 1, 1) if len(port_codes) > 0 else 1
+    
+    joint_keys = nodes.astype(np.int64) * num_ports + port_codes
+    joint_counts = np.bincount(joint_keys, minlength=n * num_ports)
+    
+    joint_mat = joint_counts.reshape((n, num_ports))
+    totals = joint_mat.sum(axis=1, keepdims=True)
+    probs = np.divide(joint_mat, totals, out=np.zeros_like(joint_mat, dtype=float), where=totals > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_probs = np.where(probs > 0, np.log2(probs), 0.0)
+    entropy = -np.sum(probs * log_probs, axis=1)
 
     return np.column_stack([
         np.log1p(out_flows), np.log1p(in_flows),

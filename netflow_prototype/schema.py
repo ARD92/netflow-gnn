@@ -44,14 +44,25 @@ def read_netflow_file(path: str | Path) -> pd.DataFrame:
     Numeric columns are coerced to float; rows with unparseable bytes or
     route_miles are dropped.
     """
-    df = pd.read_csv(
-        path,
-        sep="|",
-        usecols=lambda c: c in REQUIRED_COLUMNS,
-        dtype=str,
-        keep_default_na=False,
-        compression="infer",
-    )
+    try:
+        df = pd.read_csv(
+            path,
+            sep="|",
+            engine="pyarrow",
+            usecols=REQUIRED_COLUMNS,
+            dtype=str,
+            keep_default_na=False,
+            compression="infer",
+        )
+    except Exception:
+        df = pd.read_csv(
+            path,
+            sep="|",
+            usecols=lambda c: c in REQUIRED_COLUMNS,
+            dtype=str,
+            keep_default_na=False,
+            compression="infer",
+        )
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"{path}: missing required columns {missing}")

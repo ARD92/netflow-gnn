@@ -93,18 +93,24 @@ class EdgeConditionedLayer(nn.Module):
 
     def __init__(self, hidden: int, dropout: float) -> None:
         super().__init__()
-        self.msg_fwd = _mlp(2 * hidden, hidden, dropout=dropout)  # ingress -> egress
-        self.msg_bwd = _mlp(2 * hidden, hidden, dropout=dropout)  # egress -> ingress
+        self.proj_node_fwd = nn.Linear(hidden, hidden, bias=False)
+        self.proj_edge_fwd = nn.Linear(hidden, hidden, bias=True)
+        self.msg_rest_fwd = nn.Sequential(nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, hidden))
+
+        self.proj_node_bwd = nn.Linear(hidden, hidden, bias=False)
+        self.proj_edge_bwd = nn.Linear(hidden, hidden, bias=True)
+        self.msg_rest_bwd = nn.Sequential(nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, hidden))
+
         self.update = _mlp(3 * hidden, hidden, dropout=dropout)
         self.norm = nn.LayerNorm(hidden)
 
-    def _partial_sums(self, h: torch.Tensor, e: torch.Tensor, s: torch.Tensor,
+    def _partial_sums(self, h_fwd: torch.Tensor, h_bwd: torch.Tensor, e: torch.Tensor, s: torch.Tensor,
                       d: torch.Tensor, w: torch.Tensor | None
                       ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-router message sums for one chunk of edges (weighted by ``w``)."""
-        zeros = h.new_zeros(h.size(0), h.size(1))
-        msg_in = self.msg_fwd(torch.cat([h[s], e], dim=1))
-        msg_out = self.msg_bwd(torch.cat([h[d], e], dim=1))
+        zeros = h_fwd.new_zeros(h_fwd.size(0), h_fwd.size(1))
+        msg_in = self.msg_rest_fwd(h_fwd[s] + self.proj_edge_fwd(e))
+        msg_out = self.msg_rest_bwd(h_bwd[d] + self.proj_edge_bwd(e))
         if w is not None:
             msg_in, msg_out = msg_in * w.unsqueeze(1), msg_out * w.unsqueeze(1)
         part_in = zeros.index_add(0, d, msg_in)
@@ -124,8 +130,10 @@ class EdgeConditionedLayer(nn.Module):
         n = h.size(0)
         sum_in = h.new_zeros(n, h.size(1))
         sum_out = h.new_zeros(n, h.size(1))
+        h_fwd = self.proj_node_fwd(h)
+        h_bwd = self.proj_node_bwd(h)
         for e, (s, d, w) in zip(e_chunks, edge_chunks, strict=True):
-            part_in, part_out = _maybe_checkpoint(ckpt, self._partial_sums, h, e, s, d, w)
+            part_in, part_out = _maybe_checkpoint(ckpt, self._partial_sums, h_fwd, h_bwd, e, s, d, w)
             sum_in = sum_in + part_in
             sum_out = sum_out + part_out
         cnt_in = torch.bincount(dst, weights=weights, minlength=n)
@@ -183,7 +191,7 @@ class FlowGNN(nn.Module):
         """
         src, dst = batch["src"], batch["dst"]
         slices = _chunks(src.size(0), chunk_size)
-        ckpt = torch.is_grad_enabled() and len(slices) > 1
+        ckpt = torch.is_grad_enabled() and len(slices) > 1 and src.device.type != "cpu"
         # Optional per-edge context weight: 0 = scored but excluded from messages.
         weights = batch.get("context")
         edge_chunks = [(src[sl], dst[sl], None if weights is None else weights[sl])
@@ -289,7 +297,13 @@ def predict(model: FlowGNN, g: WindowGraph, stats: FeatureStats,
     """
     model.eval()
     batch = to_device(to_batch(g, stats), device)
-    mu, logvar = model(batch, chunk_size)
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    use_amp = device_type == "cuda"
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+        mu, logvar = model(batch, chunk_size)
+        mu = mu.float()
+        logvar = logvar.float()
     sigma = torch.exp(0.5 * logvar)
     z = ((batch["y"] - mu) / sigma).cpu().numpy()
     mu = mu.cpu().numpy() * stats.target_std + stats.target_mean

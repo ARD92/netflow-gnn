@@ -144,23 +144,39 @@ def train(
                 "chunks of %d flows", len(train_batches), len(val_batches),
                 sum(p.numel() for p in model.parameters()), cfg.chunk_size)
 
+    device_type = "cuda" if str(cfg.device).startswith("cuda") else "cpu"
+    use_amp = device_type == "cuda"
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
     def train_step(cpu_batch: dict) -> float:
         """One optimizer step on a full window, processed in checkpointed chunks."""
         batch = to_device(cpu_batch, cfg.device)
         keep = torch.rand(batch["y"].size(0), 1, device=cfg.device) >= cfg.lag_dropout
         batch["prev"] = batch["prev"] * keep
-        mu, logvar = model(batch, cfg.chunk_size)
-        loss = gaussian_nll(mu, logvar, batch["y"])
+        
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+            mu, logvar = model(batch, cfg.chunk_size)
+            loss = gaussian_nll(mu, logvar, batch["y"])
+            
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
         return loss.item()
 
     @torch.no_grad()
     def val_step(cpu_batch: dict) -> float:
         batch = to_device(cpu_batch, cfg.device)
-        return gaussian_nll(*model(batch, cfg.chunk_size), batch["y"]).item()
+        with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
+            return gaussian_nll(*model(batch, cfg.chunk_size), batch["y"]).item()
 
     def with_backoff(step, cpu_batch: dict) -> float:
         while True:
