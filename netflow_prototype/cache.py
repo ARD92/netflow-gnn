@@ -28,7 +28,7 @@ CACHE_SUFFIX = f".flows.v{CACHE_VERSION}.pkl.gz"
 
 def cache_path(cache_dir: str | Path, source: str | Path) -> Path:
     name = Path(source).name
-    for ext in (".gz", ".txt"):
+    for ext in (".gz", ".txt", ".parquet"):
         name = name.removesuffix(ext)
     return Path(cache_dir) / f"{name}{CACHE_SUFFIX}"
 

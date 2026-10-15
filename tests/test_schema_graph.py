@@ -69,3 +69,33 @@ def test_isin_sorted_matches_np_isin():
                              np.array([0, 2**64 - 1], dtype=np.uint64)])
     assert (isin_sorted(values, seen) == np.isin(values, seen)).all()
     assert not isin_sorted(values, np.zeros(0, dtype=np.uint64)).any()
+
+
+def test_read_parquet_snapshot_format(tmp_path):
+    import pandas as pd
+    parquet_path = tmp_path / "bucket_0000_20261007_1030.parquet"
+    df_raw = pd.DataFrame({
+        "timestamp": [datetime(2026, 10, 7, 10, 30)] * 3,
+        "src_id": [1, 2, 3],
+        "dst_id": [4, 5, 6],
+        "src_router": ["ROUTER_A", "ROUTER_B", "ROUTER_C"],
+        "dst_router": ["ROUTER_D", "ROUTER_E", "ROUTER_F"],
+        "router_pair": ["ROUTER_A -> ROUTER_D", "ROUTER_B -> ROUTER_E", "ROUTER_C -> ROUTER_F"],
+        "bytes": [1000.0, 2000.0, 3000.0],
+        "packets": [10, 20, 30],
+        "flow_count": [1, 2, 3],
+        "is_anomaly": [False, False, True],
+    })
+    df_raw.to_parquet(parquet_path)
+
+    flows = load_window(parquet_path)
+    assert len(flows) == 3
+    assert set(flows["ingress"]) == {"ROUTER_A", "ROUTER_B", "ROUTER_C"}
+    assert set(flows["egress"]) == {"ROUTER_D", "ROUTER_E", "ROUTER_F"}
+    assert (flows["dstPort"] == "*").all()
+    assert (flows["route_miles"] > 0).all()
+
+    g = build_window_graph(flows, datetime(2026, 10, 7, 10, 30))
+    assert g.num_nodes == 6
+    assert g.num_edges == 3
+    assert g.y.shape == (3, 2)

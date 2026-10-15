@@ -267,7 +267,11 @@ def build_window_graph(
         y=y,
         time_x=time_features(timestamp),
         flow_hash=fhash,
-        flows=flows[FLOW_KEY + ["bytes", "packets", "route_miles"]] if keep_flows else None,
+        flows=(flows[[c for c in flows.columns
+                      if c in FLOW_KEY + ["bytes", "packets", "route_miles",
+                                          "customer", "service", "application",
+                                          "anomaly_type", "is_anomaly"]]]
+               if keep_flows else None),
         context=None if context_flows is None else ctx,
     )
 

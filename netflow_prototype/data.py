@@ -15,7 +15,7 @@ import pandas as pd
 
 from netflow_prototype.graph import HashConfig, WindowGraph, build_window_graph
 from netflow_prototype.cache import load_window_cached
-from netflow_prototype.windows import DEFAULT_INTERVAL, file_name
+from netflow_prototype.windows import DEFAULT_INTERVAL, file_name, index_directory
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,12 @@ def context_file(data_dir: Path, first: datetime,
                  interval: timedelta = DEFAULT_INTERVAL) -> tuple[datetime, Path] | None:
     """Return the file immediately before ``first`` (used only for lag features)."""
     ts = first - interval
+    try:
+        idx = index_directory(data_dir)
+        if ts in idx:
+            return ts, idx[ts]
+    except Exception:
+        pass
     for gz in (True, False):
         path = Path(data_dir) / file_name(ts, gz=gz)
         if path.exists():

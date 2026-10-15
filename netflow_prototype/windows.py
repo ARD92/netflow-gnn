@@ -12,7 +12,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-FILE_PATTERN = re.compile(r"^netflow\.(\d{8})\.(\d{2})\.(\d{2})\.txt(\.gz)?$")
+FILE_PATTERNS = [
+    re.compile(r"^netflow\.(\d{8})\.(\d{2})\.(\d{2})\.(?:txt|parquet)(?:\.gz)?$"),
+    re.compile(r"^(?:.*_)?bucket_\d+_(\d{8})_(\d{2})(\d{2})\.parquet$"),
+    re.compile(r"^(?:.*_)?bucket_(\d{8})_(\d{2})(\d{2})\.parquet$"),
+    re.compile(r"^.*?(\d{8})_(\d{2})(\d{2})\.parquet$"),
+]
+FILE_PATTERN = FILE_PATTERNS[0]
 DEFAULT_INTERVAL = timedelta(minutes=10)
 
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([mhd])\s*$", re.IGNORECASE)
@@ -84,12 +90,13 @@ def resolve_range(
 
 
 def file_timestamp(path: Path) -> datetime | None:
-    """Extract the window timestamp from a NetFlow file name."""
-    match = FILE_PATTERN.match(path.name)
-    if not match:
-        return None
-    day, hour, minute = match.group(1), match.group(2), match.group(3)
-    return datetime.strptime(f"{day}{hour}{minute}", "%Y%m%d%H%M")
+    """Extract the window timestamp from a NetFlow export or snapshot file name."""
+    for pattern in FILE_PATTERNS:
+        match = pattern.match(path.name)
+        if match:
+            day, hour, minute = match.group(1), match.group(2), match.group(3)
+            return datetime.strptime(f"{day}{hour}{minute}", "%Y%m%d%H%M")
+    return None
 
 
 def file_name(ts: datetime, gz: bool = True) -> str:
@@ -103,8 +110,12 @@ def index_directory(data_dir: str | Path) -> dict[datetime, Path]:
     for path in Path(data_dir).iterdir():
         ts = file_timestamp(path)
         if ts is not None:
-            # Prefer the compressed file when both exist.
-            if ts not in index or path.suffix == ".gz":
+            # Prefer parquet over gz over txt when both exist.
+            if ts not in index:
+                index[ts] = path
+            elif path.suffix == ".parquet":
+                index[ts] = path
+            elif path.suffix == ".gz" and index[ts].suffix != ".parquet":
                 index[ts] = path
     return index
 
@@ -139,7 +150,7 @@ def files_from_paths(paths: list[str | Path]) -> FileSet:
     for p in map(Path, paths):
         ts = file_timestamp(p)
         if ts is None:
-            raise ValueError(f"{p.name} does not match netflow.YYYYMMDD.HH.MM.txt[.gz]")
+            raise ValueError(f"{p.name} does not match supported netflow or bucket file naming conventions")
         files.append((ts, p))
     files.sort()
     return FileSet(start=files[0][0], end=files[-1][0] + DEFAULT_INTERVAL, files=files)

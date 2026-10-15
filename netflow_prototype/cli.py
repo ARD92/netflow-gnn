@@ -43,7 +43,7 @@ def _window_options(func):
     """Shared options that turn a time window into a list of files."""
     options = [
         click.option("--data-dir", "-d", type=click.Path(file_okay=False, path_type=Path),
-                     help="Directory containing netflow.YYYYMMDD.HH.MM.txt.gz files."),
+                     help="Directory containing netflow exports (.txt.gz) or bucket snapshots (.parquet)."),
         click.option("--start", "-s", help="Window start, e.g. '2026-10-06 00:00'."),
         click.option("--end", "-e", help="Window end (exclusive), e.g. '2026-10-06 12:00'."),
         click.option("--duration", help="Window length instead of --end, e.g. 6h, 90m, 2d."),
@@ -145,6 +145,10 @@ def files(data_dir: Path, start: str, end: str, duration: str, verbose: bool) ->
 @click.option("--max-gpu-mem-gb", default=16.0, show_default=True,
               help="Hard cap on GPU memory used by this process (0 = no cap).")
 @click.option("--seed", default=7, show_default=True)
+@click.option("--init-model", type=click.Path(exists=True, path_type=Path),
+              help="Existing model directory to warm-start weights and baselines.")
+@click.option("--accumulate-seen/--no-accumulate-seen", default=True, show_default=True,
+              help="Accumulate known flows from the initial model into seen_flows.npy.")
 @_io_options
 @click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="port,application file adding to or overriding the built-in port names.")
@@ -152,7 +156,8 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
           model_dir: Path, epochs: int, lr: float, hidden_dim: int, num_layers: int,
           dropout: float, router_buckets: int, prefix_buckets: int,
           max_flows_per_window: int | None, chunk_size: int, device: str,
-          max_gpu_mem_gb: float, seed: int, cache_dir: Path | None, workers: int,
+          max_gpu_mem_gb: float, seed: int, init_model: Path | None,
+          accumulate_seen: bool, cache_dir: Path | None, workers: int,
           port_map: Path | None) -> None:
     """Train the GNN on all files in a time window."""
     from netflow_prototype.model import ModelConfig
@@ -168,11 +173,88 @@ def train(data_dir: Path, start: str, end: str, duration: str, verbose: bool,
                     router_buckets=router_buckets, prefix_buckets=prefix_buckets),
         TrainConfig(epochs=epochs, lr=lr, max_flows_per_window=max_flows_per_window,
                     chunk_size=chunk_size, device=device,
-                    max_gpu_mem_gb=max_gpu_mem_gb or None, seed=seed),
+                    max_gpu_mem_gb=max_gpu_mem_gb or None, seed=seed,
+                    init_model=init_model, accumulate_seen=accumulate_seen),
         context=context_file(data_dir, fileset.files[0][0], DEFAULT_INTERVAL),
         cache_dir=cache_dir,
         workers=workers,
         port_map=port_map,
+        init_model=init_model,
+    )
+    meta = {k: v for k, v in summary["meta"].items() if k != "files"}
+    click.echo(json.dumps({"meta": meta, "thresholds": summary["thresholds"]}, indent=2))
+
+
+@main.command()
+@click.option("--data-dir", "-d", required=True, type=click.Path(file_okay=False, path_type=Path),
+              help="Directory containing netflow exports (.txt.gz) or bucket snapshots (.parquet).")
+@click.option("--model-dir", "-m", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Existing model directory to warm-start and update.")
+@click.option("--out-dir", "-o", type=click.Path(path_type=Path),
+              help="Where to write updated model (defaults to updating --model-dir in-place).")
+@click.option("--start", "-s", help="Window start (defaults to rolling window ending at latest data).")
+@click.option("--end", "-e", help="Window end (exclusive).")
+@click.option("--duration", default="24h", show_default=True,
+              help="Rolling window length (e.g. 24h, 7d, 6h).")
+@click.option("--epochs", default=10, show_default=True,
+              help="Training epochs for rolling fine-tune.")
+@click.option("--lr", default=1e-4, show_default=True,
+              help="Learning rate for rolling fine-tune.")
+@click.option("--device", default="cpu", show_default=True, help="cpu, cuda, or mps.")
+@click.option("--chunk-size", default=250_000, show_default=True,
+              help="Flows processed per GPU chunk; lower it to use less memory.")
+@click.option("--accumulate-seen/--no-accumulate-seen", default=True, show_default=True,
+              help="Accumulate known flows from the existing model into seen_flows.npy.")
+@_io_options
+@click.option("--port-map", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="port,application file adding to or overriding the built-in port names.")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+def retrain(data_dir: Path, model_dir: Path, out_dir: Path | None, start: str | None,
+            end: str | None, duration: str, epochs: int, lr: float, device: str,
+            chunk_size: int, accumulate_seen: bool, cache_dir: Path | None, workers: int,
+            port_map: Path | None, verbose: bool) -> None:
+    """Retrain an existing model on a rolling time window with accumulated flow inventory."""
+    import torch
+    from netflow_prototype.model import ModelConfig
+    from netflow_prototype.train import ARTIFACT_NAME, TrainConfig
+    from netflow_prototype.train import train as run_train
+    from netflow_prototype.windows import index_directory
+
+    _setup_logging(verbose)
+    target_dir = out_dir or model_dir
+
+    if start is None:
+        idx = index_directory(data_dir)
+        if not idx:
+            raise FileNotFoundError(f"No NetFlow or snapshot files found in {data_dir}")
+        latest_ts = max(idx.keys())
+        dur = parse_duration(duration)
+        end_ts = latest_ts + DEFAULT_INTERVAL
+        start_ts = end_ts - dur
+        fileset = resolve_files(data_dir, start_ts, end_ts)
+        logger.info("Rolling window automatically set to %s -> %s based on latest snapshot",
+                    start_ts, end_ts)
+    else:
+        fileset = _resolve(data_dir, start, end, duration)
+
+    art_file = model_dir / ARTIFACT_NAME
+    model_cfg = None
+    if art_file.exists():
+        art = torch.load(art_file, map_location="cpu", weights_only=False)
+        if "model_config" in art:
+            model_cfg = ModelConfig(**art["model_config"])
+
+    summary = run_train(
+        fileset,
+        target_dir,
+        model_cfg=model_cfg,
+        train_cfg=TrainConfig(epochs=epochs, lr=lr, chunk_size=chunk_size, device=device,
+                              init_model=model_dir, accumulate_seen=accumulate_seen),
+        context=context_file(data_dir, fileset.files[0][0], DEFAULT_INTERVAL),
+        cache_dir=cache_dir,
+        workers=workers,
+        port_map=port_map,
+        init_model=model_dir,
     )
     meta = {k: v for k, v in summary["meta"].items() if k != "files"}
     click.echo(json.dumps({"meta": meta, "thresholds": summary["thresholds"]}, indent=2))
@@ -421,6 +503,25 @@ def visualize(file_path: Path, results_dir: Path | None, out: Path, router: str 
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     click.echo(json.dumps(summary, indent=2))
+
+
+@main.command()
+@click.option("--model-dir", "-m", required=True, type=click.Path(exists=True, path_type=Path),
+              help="Trained model directory (containing model.pt).")
+@click.option("--results-dir", "-r", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path),
+              help="Inference output directory (containing edge_anomalies.csv, window_scores.csv).")
+@click.option("--out", "-o", default="results/inference_report.html", show_default=True,
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="Destination path for the standalone HTML report.")
+@click.option("--verbose", "-v", is_flag=True)
+def report(model_dir: Path, results_dir: Path, out: Path, verbose: bool) -> None:
+    """Generate an interactive HTML inference report with analytics and GNN model inspection."""
+    from netflow_prototype.report_html import extract_report_data, render_html_report
+
+    _setup_logging(verbose)
+    data = extract_report_data(model_dir, results_dir)
+    report_file = render_html_report(data, out)
+    click.echo(f"HTML Report generated: {report_file}")
 
 
 if __name__ == "__main__":

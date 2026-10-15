@@ -80,6 +80,50 @@ class PairBaselineBuilder:
         return out.reset_index(drop=True)
 
 
+def merge_pair_baselines(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge an existing pair baseline with a newly built one for rolling retraining."""
+    if old_df is None or old_df.empty:
+        return new_df
+    if new_df is None or new_df.empty:
+        return old_df
+
+    old_indexed = old_df.set_index(["ingress", "egress"])
+    new_indexed = new_df.set_index(["ingress", "egress"])
+
+    common = old_indexed.index.intersection(new_indexed.index)
+    old_only = old_indexed.index.difference(new_indexed.index)
+    new_only = new_indexed.index.difference(old_indexed.index)
+
+    parts = []
+    if len(old_only):
+        parts.append(old_indexed.loc[old_only].reset_index())
+    if len(new_only):
+        parts.append(new_indexed.loc[new_only].reset_index())
+    if len(common):
+        c_old = old_indexed.loc[common]
+        c_new = new_indexed.loc[common]
+        w_old = c_old["windows"].to_numpy(dtype=float)
+        w_new = c_new["windows"].to_numpy(dtype=float)
+        w_tot = w_old + w_new
+
+        med = (c_old["median_miles"].to_numpy(dtype=float) * w_old +
+               c_new["median_miles"].to_numpy(dtype=float) * w_new) / w_tot
+        lo = np.minimum(c_old["low_miles"].to_numpy(dtype=float), c_new["low_miles"].to_numpy(dtype=float))
+        hi = np.maximum(c_old["high_miles"].to_numpy(dtype=float), c_new["high_miles"].to_numpy(dtype=float))
+
+        merged_common = pd.DataFrame({
+            "ingress": common.get_level_values(0),
+            "egress": common.get_level_values(1),
+            "median_miles": med,
+            "low_miles": lo,
+            "high_miles": hi,
+            "windows": w_tot.astype(int),
+        })
+        parts.append(merged_common)
+
+    return pd.concat(parts, ignore_index=True)
+
+
 class WindowBaselines:
     """Builds every file-derived baseline (router pairs, applications) in one pass."""
 
@@ -101,12 +145,20 @@ class WindowBaselines:
         self.pairs.add(pairs)
         self.apps.add(ts, app_totals, app_pairs)
 
-    def save(self, model_dir: str | Path) -> dict[str, int]:
+    def save(self, model_dir: str | Path, init_dir: str | Path | None = None) -> dict[str, int]:
         from netflow_prototype import appbaseline
 
         pair_table = self.pairs.build()
+        if init_dir:
+            old_pairs = load(init_dir)
+            if old_pairs is not None and not old_pairs.empty:
+                pair_table = merge_pair_baselines(old_pairs.reset_index(), pair_table)
         save(pair_table, model_dir)
         apps, app_pairs = self.apps.build()
+        if init_dir:
+            old_app_base = appbaseline.AppBaseline.load(init_dir)
+            if old_app_base is not None:
+                apps, app_pairs = appbaseline.merge_app_baselines(old_app_base, apps, app_pairs)
         appbaseline.save(apps, app_pairs, model_dir)
         return {"router_pairs": len(pair_table),
                 "applications": int((apps["hour"] == -1).sum()) if len(apps) else 0,

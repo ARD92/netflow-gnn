@@ -160,6 +160,82 @@ def save(apps: pd.DataFrame, pairs: pd.DataFrame, model_dir: str | Path) -> None
     pairs.to_csv(Path(model_dir) / APP_PAIR_BASELINE_NAME, index=False, float_format="%.6f")
 
 
+def merge_app_baselines(old_base: AppBaseline, new_apps: pd.DataFrame,
+                        new_pairs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Merge an existing AppBaseline with newly built application baseline tables."""
+    if new_apps.empty:
+        return old_base.apps.reset_index(), old_base.pairs.reset_index()
+    if old_base is None or old_base.apps.empty:
+        return new_apps, new_pairs
+
+    old_apps = old_base.apps
+    new_apps_idx = new_apps.set_index(["application", "hour"])
+    common_apps = old_apps.index.intersection(new_apps_idx.index)
+    old_only_apps = old_apps.index.difference(new_apps_idx.index)
+    new_only_apps = new_apps_idx.index.difference(old_apps.index)
+
+    app_parts = [old_apps.loc[old_only_apps].reset_index(),
+                 new_apps_idx.loc[new_only_apps].reset_index()]
+    if len(common_apps):
+        c_old = old_apps.loc[common_apps]
+        c_new = new_apps_idx.loc[common_apps]
+        w_old = c_old["windows"].to_numpy(dtype=float)
+        w_new = c_new["windows"].to_numpy(dtype=float)
+        w_tot = w_old + w_new
+
+        merged_common_apps = pd.DataFrame({
+            "application": common_apps.get_level_values(0),
+            "hour": common_apps.get_level_values(1),
+            "windows": w_tot.astype(int),
+            "median_bytes": (c_old["median_bytes"].to_numpy(dtype=float) * w_old +
+                             c_new["median_bytes"].to_numpy(dtype=float) * w_new) / w_tot,
+            "p99_bytes": np.maximum(c_old["p99_bytes"].to_numpy(dtype=float),
+                                    c_new["p99_bytes"].to_numpy(dtype=float)),
+            "median_flows": (c_old["median_flows"].to_numpy(dtype=float) * w_old +
+                             c_new["median_flows"].to_numpy(dtype=float) * w_new) / w_tot,
+            "presence": (c_old["presence"].to_numpy(dtype=float) * w_old +
+                         c_new["presence"].to_numpy(dtype=float) * w_new) / w_tot,
+        })
+        app_parts.append(merged_common_apps)
+    merged_apps = pd.concat([p for p in app_parts if not p.empty], ignore_index=True)
+
+    old_pairs = old_base.pairs
+    new_pairs_idx = new_pairs.set_index(["application", "ingress", "egress"])
+    common_pairs = old_pairs.index.intersection(new_pairs_idx.index)
+    old_only_pairs = old_pairs.index.difference(new_pairs_idx.index)
+    new_only_pairs = new_pairs_idx.index.difference(old_pairs.index)
+
+    pair_parts = [old_pairs.loc[old_only_pairs].reset_index(),
+                  new_pairs_idx.loc[new_only_pairs].reset_index()]
+    if len(common_pairs):
+        p_old = old_pairs.loc[common_pairs]
+        p_new = new_pairs_idx.loc[common_pairs]
+        w_old = p_old["windows"].to_numpy(dtype=float)
+        w_new = p_new["windows"].to_numpy(dtype=float)
+        w_tot = w_old + w_new
+
+        merged_common_pairs = pd.DataFrame({
+            "application": common_pairs.get_level_values(0),
+            "ingress": common_pairs.get_level_values(1),
+            "egress": common_pairs.get_level_values(2),
+            "windows": w_tot.astype(int),
+            "mean_log_bytes": (p_old["mean_log_bytes"].to_numpy(dtype=float) * w_old +
+                               p_new["mean_log_bytes"].to_numpy(dtype=float) * w_new) / w_tot,
+            "std_log_bytes": np.maximum(p_old["std_log_bytes"].to_numpy(dtype=float),
+                                        p_new["std_log_bytes"].to_numpy(dtype=float)),
+            "max_bytes": np.maximum(p_old["max_bytes"].to_numpy(dtype=float),
+                                    p_new["max_bytes"].to_numpy(dtype=float)),
+            "mean_flows": (p_old["mean_flows"].to_numpy(dtype=float) * w_old +
+                           p_new["mean_flows"].to_numpy(dtype=float) * w_new) / w_tot,
+            "presence": (p_old["presence"].to_numpy(dtype=float) * w_old +
+                         p_new["presence"].to_numpy(dtype=float) * w_new) / w_tot,
+        })
+        pair_parts.append(merged_common_pairs)
+    merged_pairs = pd.concat([p for p in pair_parts if not p.empty], ignore_index=True)
+
+    return merged_apps, merged_pairs
+
+
 @dataclass
 class AppBaseline:
     apps: pd.DataFrame   # indexed by (application, hour); hour -1 = all hours

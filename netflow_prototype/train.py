@@ -49,6 +49,8 @@ class TrainConfig:
     min_edge_threshold: float = 4.0   # floor on the edge z-score threshold
     seed: int = 7
     device: str = "cpu"
+    init_model: str | Path | None = None
+    accumulate_seen: bool = True
 
 
 def _back_off(size: int, what: str, minimum: int = 5_000) -> int:
@@ -110,10 +112,13 @@ def train(
     cache_dir: str | Path | None = None,
     workers: int = 1,
     port_map: str | Path | None = None,
+    init_model: str | Path | None = None,
 ) -> dict:
     """Train on every file in ``fileset`` and write the model artifact."""
     model_cfg = model_cfg or ModelConfig()
     cfg = train_cfg or TrainConfig()
+    init_ref = str(init_model or cfg.init_model) if (init_model or cfg.init_model) else None
+    cfg.init_model = init_ref
     if not fileset.files:
         raise ValueError("No NetFlow files found in the requested time window.")
     torch.manual_seed(cfg.seed)
@@ -139,6 +144,15 @@ def train(
     cuda = str(cfg.device).startswith("cuda")
 
     model = FlowGNN(model_cfg).to(cfg.device)
+    if init_ref:
+        init_p = Path(init_ref)
+        art_path = init_p / ARTIFACT_NAME if init_p.is_dir() else init_p
+        if art_path.exists():
+            logger.info("Warm-starting model weights from %s", art_path)
+            loaded_artifact = torch.load(art_path, map_location=cfg.device, weights_only=False)
+            if "state_dict" in loaded_artifact:
+                model.load_state_dict(loaded_artifact["state_dict"])
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     logger.info("Training on %d windows, validating on %d; %d parameters; "
                 "chunks of %d flows", len(train_batches), len(val_batches),
@@ -223,9 +237,20 @@ def train(
                 thresholds["edge_score"], thresholds["window_flagged_fraction"])
 
     seen = np.unique(np.concatenate([g.flow_hash for g in graphs]))
+    if init_ref and cfg.accumulate_seen:
+        init_p = Path(init_ref)
+        seen_path = init_p / SEEN_FLOWS_NAME if init_p.is_dir() else init_p.parent / SEEN_FLOWS_NAME
+        if seen_path.exists():
+            prev_seen = np.load(seen_path)
+            seen = np.unique(np.concatenate([prev_seen, seen]))
+            logger.info("Accumulated %d previously seen flows with %d new flows (total %d)",
+                        len(prev_seen), len(np.unique(np.concatenate([g.flow_hash for g in graphs]))), len(seen))
     np.save(model_dir / SEEN_FLOWS_NAME, seen)
     save_port_map(load_port_map(port_map), model_dir)
-    logger.info("Baselines: %s", window_baselines.save(model_dir))
+    init_dir = Path(init_ref) if init_ref else None
+    if init_dir and not init_dir.is_dir():
+        init_dir = init_dir.parent
+    logger.info("Baselines: %s", window_baselines.save(model_dir, init_dir=init_dir))
 
     meta = {
         "train_start": str(fileset.start),
@@ -238,6 +263,7 @@ def train(
         "unique_flows": int(len(seen)),
         "train_seconds": round(time.time() - t0, 1),
         "best_val_nll": best_val,
+        "init_model": str(init_ref) if init_ref else None,
     }
     torch.save({
         "model_config": model_cfg.to_dict(),

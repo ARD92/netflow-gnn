@@ -79,3 +79,33 @@ def test_pair_baseline_command(tmp_path):
     apps = pd.read_csv(model / "app_baseline.csv")
     assert {"https", "dns"} <= set(apps["application"]) and summary["applications"] > 0
     assert (model / "app_pair_baseline.csv").exists()
+
+
+def test_merge_pair_baselines():
+    from netflow_prototype.baselines import merge_pair_baselines
+
+    df1 = pd.DataFrame({
+        "ingress": ["R1", "R2"],
+        "egress": ["R10", "R20"],
+        "median_miles": [100.0, 200.0],
+        "low_miles": [90.0, 190.0],
+        "high_miles": [110.0, 210.0],
+        "windows": [10, 10],
+    })
+    df2 = pd.DataFrame({
+        "ingress": ["R2", "R3"],
+        "egress": ["R20", "R30"],
+        "median_miles": [220.0, 300.0],
+        "low_miles": [180.0, 290.0],
+        "high_miles": [230.0, 310.0],
+        "windows": [10, 5],
+    })
+    merged = merge_pair_baselines(df1, df2).set_index(["ingress", "egress"])
+    assert len(merged) == 3
+    assert merged.loc[("R1", "R10"), "windows"] == 10
+    assert merged.loc[("R3", "R30"), "windows"] == 5
+    r2 = merged.loc[("R2", "R20")]
+    assert r2["windows"] == 20
+    assert r2["median_miles"] == 210.0
+    assert r2["low_miles"] == 180.0
+    assert r2["high_miles"] == 230.0

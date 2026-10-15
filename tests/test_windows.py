@@ -43,6 +43,9 @@ def test_file_timestamp():
 
     assert file_timestamp(Path("netflow.20261006.11.50.txt.gz")) == datetime(2026, 10, 6, 11, 50)
     assert file_timestamp(Path("netflow.20261006.11.50.txt")) == datetime(2026, 10, 6, 11, 50)
+    assert file_timestamp(Path("netflow.20261006.11.50.parquet")) == datetime(2026, 10, 6, 11, 50)
+    assert file_timestamp(Path("bucket_0000_20261007_1030.parquet")) == datetime(2026, 10, 7, 10, 30)
+    assert file_timestamp(Path("bucket_20261007_1030.parquet")) == datetime(2026, 10, 7, 10, 30)
     assert file_timestamp(Path("other.txt.gz")) is None
 
 
@@ -52,3 +55,12 @@ def test_resolve_files_half_open_window_and_missing(tmp_path):
     fs = resolve_files(tmp_path, datetime(2026, 10, 6, 11), datetime(2026, 10, 6, 12))
     assert [t.minute for t in fs.timestamps] == [0, 10, 30, 40, 50]
     assert fs.missing == [datetime(2026, 10, 6, 11, 20)]
+
+
+def test_resolve_files_parquet_bucket_format(tmp_path):
+    (tmp_path / "bucket_0000_20261007_1030.parquet").write_bytes(b"")
+    (tmp_path / "bucket_0001_20261007_1040.parquet").write_bytes(b"")
+    (tmp_path / "bucket_0003_20261007_1100.parquet").write_bytes(b"")
+    fs = resolve_files(tmp_path, datetime(2026, 10, 7, 10, 30), datetime(2026, 10, 7, 11, 10))
+    assert len(fs.files) == 3
+    assert fs.missing == [datetime(2026, 10, 7, 10, 50)]
