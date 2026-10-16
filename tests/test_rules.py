@@ -8,6 +8,13 @@ import pandas as pd
 from netflow_prototype.infer import _node_scores, _window_scores
 from netflow_prototype.report import write_report
 from netflow_prototype.rules import (
+    CATEGORY_BLACKHOLE,
+    CATEGORY_FIBER_REROUTE,
+    CATEGORY_INGRESS_BURST,
+    CATEGORY_NORMAL,
+    CATEGORY_REROUTE_CONGESTION,
+    CATEGORY_ROUTE_FLAPPING,
+    CATEGORY_TRAFFIC_BURST,
     STATUS_ANOMALY,
     STATUS_NEW,
     STATUS_NORMAL,
@@ -15,6 +22,7 @@ from netflow_prototype.rules import (
     RuleConfig,
     add_baselines,
     apply_rules,
+    categorize_anomalies,
     graph_edges,
 )
 
@@ -23,13 +31,15 @@ TEN = timedelta(minutes=10)
 
 
 def _row(flow_id, minutes, miles=851.0, nbytes=1e6, flag=False, new=False, prev=None,
-         ingress="PE-DAL-01", egress="PE-LAX-01", score=None):
+         ingress="PE-DAL-01", egress="PE-LAX-01", score=None, z_bytes=0.0, z_miles=None):
+    zm = (9.0 if flag else 0.5) if z_miles is None else z_miles
+    sc = score if score is not None else max(abs(z_bytes), abs(zm))
     return {
         "window": T0 + timedelta(minutes=minutes), "ingress": ingress, "egress": egress,
         "srcIpPrefix": f"10.0.{flow_id % 250}.0/24", "dstIpPrefix": "203.0.113.0/24",
         "dstPort": "443", "flow_type": "web", "bytes": nbytes, "packets": 10.0,
-        "route_miles": miles, "z_bytes": 0.0, "z_miles": 9.0 if flag else 0.5,
-        "score": score if score is not None else (9.0 if flag else 0.5),
+        "route_miles": miles, "z_bytes": z_bytes, "z_miles": zm,
+        "score": sc,
         "expected_bytes": 1e6, "expected_route_miles": 851.0,
         "flow_id": np.uint64(flow_id), "is_new_flow": new, "model_flag": flag,
         "prev_present": prev is not None,
@@ -149,3 +159,61 @@ def test_readable_report(tmp_path):
     assert "[REPEATED VIOLATION]" in text and "10:00 851.0 -> 10:10 1810.0 -> 10:20 852.0" in text
     assert "[NEW-FLOW BURST] ingress PE-CHI-01: 10 new flows" in text
     assert "route_miles: 851.0 at 2026-10-06 10:00  ->  1,810.0 at 2026-10-06 10:10" in text
+
+
+def test_anomaly_categorization_buckets():
+    rows = [
+        _row(1, 0, flag=True, z_miles=8.5, z_bytes=0.2),         # Fiber reroute
+        _row(2, 0, flag=True, z_miles=0.1, z_bytes=6.0),         # Traffic burst
+        _row(3, 0, flag=True, z_miles=0.0, z_bytes=-5.2),        # Blackhole / Drop
+        _row(4, 0, flag=True, z_miles=7.0, z_bytes=5.5),         # Reroute with congestion
+        _row(5, 0, flag=False, z_miles=0.2, z_bytes=0.3),        # Normal
+    ]
+    edges, _ = apply_rules(_edges(rows), RuleConfig(edge_threshold=4.0))
+    cat = edges.set_index("flow_id")["anomaly_category"]
+    assert cat[1] == CATEGORY_FIBER_REROUTE
+    assert cat[2] == CATEGORY_TRAFFIC_BURST
+    assert cat[3] == CATEGORY_BLACKHOLE
+    assert cat[4] == CATEGORY_REROUTE_CONGESTION
+    assert cat[5] == CATEGORY_NORMAL
+
+
+def test_anomaly_categorization_route_flapping():
+    rows = [
+        _row(1, 0, 851),
+        _row(1, 10, 1810, flag=True, z_miles=9.0),
+        _row(1, 20, 852),
+    ]
+    edges, _ = apply_rules(_edges(rows), RuleConfig(edge_threshold=4.0))
+    flapped = edges[(edges["flow_id"] == 1) & (edges["window"] == T0 + 2 * TEN)].iloc[0]
+    assert flapped["status"] == STATUS_REPEATED
+    assert flapped["anomaly_category"] == CATEGORY_ROUTE_FLAPPING
+
+
+def test_anomaly_categorization_ingress_scan_burst():
+    burst = [_row(1000 + i, 0, new=True, ingress="PE-CHI-01") for i in range(12)]
+    edges, bursts = apply_rules(_edges(burst), RuleConfig(new_flow_burst=10))
+    burst_flows = edges[edges["in_new_flow_burst"]]
+    assert len(burst_flows) == 12
+    assert (burst_flows["anomaly_category"] == CATEGORY_INGRESS_BURST).all()
+
+
+def test_report_groups_by_category(tmp_path):
+    rows = [
+        _row(1, 0, flag=True, z_miles=8.5, z_bytes=0.2),  # Fiber reroute
+        _row(2, 0, flag=True, z_miles=0.1, z_bytes=6.0),  # Traffic burst
+    ]
+    cfg = RuleConfig(edge_threshold=4.0)
+    edges, bursts = apply_rules(_edges(rows), cfg)
+    edges = add_baselines(edges, cfg)
+    nodes = _node_scores(edges, bursts)
+    windows = _window_scores(edges, bursts, thr=0.5)
+    summary = {"thresholds": {"edge_score": 4.0}, "missing_windows": []}
+    path = write_report(tmp_path / "report_cat.txt", edges, nodes, windows, bursts,
+                        summary, cfg, {"train_start": "t0", "train_end": "t1"})
+    text = path.read_text()
+    assert "Categories       :" in text
+    assert "Fiber Reroute" in text
+    assert "Traffic Burst / Congestion" in text
+    assert "-- Category: Fiber Reroute (1 flows) --" in text
+    assert "-- Category: Traffic Burst / Congestion (1 flows) --" in text

@@ -22,6 +22,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate per-10min bucket Parquet files.")
     parser.add_argument("--mode", choices=["24h", "7d"], default="24h",
                         help="Choose '24h' (144 files) or '7d' (1008 files).")
+    parser.add_argument("--num_buckets", type=int, default=None,
+                        help="Explicit number of 10-min files to generate (overrides --mode).")
     parser.add_argument("--nodes", type=int, default=2000, help="Number of nodes (default: 2000).")
     parser.add_argument("--active_ratio", type=float, default=0.015,
                         help="Ratio of active pairs per bucket (default: 0.015 -> ~60k edges/file).")
@@ -35,7 +37,10 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     num_nodes = args.nodes
-    total_buckets = 144 if args.mode == "24h" else 1008
+    if args.num_buckets is not None:
+        total_buckets = args.num_buckets
+    else:
+        total_buckets = 144 if args.mode == "24h" else 1008
     edges_per_bucket = int(num_nodes * (num_nodes - 1) * args.active_ratio)
 
     print(f"[*] Configuration:")

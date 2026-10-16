@@ -179,11 +179,18 @@ def extract_report_data(model_dir: str | Path, results_dir: str | Path) -> dict:
 
     # Anomaly records for explorer table
     explorer_rows = []
+    category_counts = {}
+    if not edges_df.empty and "anomaly_category" in edges_df.columns:
+        category_counts = edges_df["anomaly_category"].value_counts().to_dict()
+    elif not edges_df.empty:
+        category_counts = {"other_anomaly": len(edges_df)}
+
     if not edges_df.empty:
         sample_edges = edges_df.head(200)
         for _, r in sample_edges.iterrows():
             explorer_rows.append({
                 "time": str(r.get("detected_time", r.get("window", "10:50"))),
+                "category": str(r.get("anomaly_category", "other_anomaly")),
                 "ingress": str(r.get("ingress", "")),
                 "egress": str(r.get("egress", "")),
                 "app": str(r.get("application", "any")),
@@ -203,6 +210,7 @@ def extract_report_data(model_dir: str | Path, results_dir: str | Path) -> dict:
         "tensors": tensors_data,
         "total_params": sum(t["numel"] for t in tensors_data),
         "app_counts": app_counts,
+        "category_counts": category_counts,
         "cities": city_names,
         "chord_matrix": chord_matrix.tolist(),
         "route_scatter": route_scatter,
@@ -646,6 +654,24 @@ def render_html_report(data: dict, output_file: str | Path) -> Path:
       background: rgba(255, 255, 255, 0.02);
     }}
 
+    /* Anomaly Category Badges */
+    .badge-cat {{
+      display: inline-block;
+      padding: 2px 7px;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 4px;
+      white-space: nowrap;
+    }}
+    .badge-fiber_reroute {{ background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }}
+    .badge-traffic_burst {{ background: rgba(249, 115, 22, 0.2); color: #fb923c; border: 1px solid rgba(249, 115, 22, 0.3); }}
+    .badge-blackhole {{ background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }}
+    .badge-reroute_with_congestion {{ background: rgba(236, 72, 153, 0.2); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.3); }}
+    .badge-route_flapping {{ background: rgba(234, 179, 8, 0.2); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.3); }}
+    .badge-ingress_scan_burst {{ background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }}
+    .badge-new_flow {{ background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }}
+    .badge-other_anomaly {{ background: rgba(255, 255, 255, 0.1); color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.15); }}
+
     /* GNN Weights Inspector */
     .gnn-grid {{
       display: grid;
@@ -1021,16 +1047,29 @@ def render_html_report(data: dict, output_file: str | Path) -> Path:
           <div class="card-desc">Detailed flow records with z-scores, expected volumes, routing miles, and reasons.</div>
         </div>
       </div>
-      <div style="margin-bottom: 16px;">
+      <div style="margin-bottom: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
         <input type="text" id="explorer-search" placeholder="Search by router, application, customer, or reason..." 
-               style="width: 100%; max-width: 400px; padding: 10px 14px; background: var(--bg-card-sub); border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 13px;"
-               oninput="filterExplorer(this.value)">
+               style="width: 100%; max-width: 380px; padding: 10px 14px; background: var(--bg-card-sub); border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 13px;"
+               oninput="filterExplorer()">
+        <select id="explorer-cat-filter"
+                style="padding: 10px 14px; background: var(--bg-card-sub); border: 1px solid var(--border); border-radius: 6px; color: #fff; font-size: 13px;"
+                onchange="filterExplorer()">
+          <option value="">All Categories</option>
+          <option value="fiber_reroute">Fiber Reroute</option>
+          <option value="traffic_burst">Traffic Burst / Congestion</option>
+          <option value="blackhole">Capacity Degradation / Blackhole</option>
+          <option value="reroute_with_congestion">Reroute with Congestion</option>
+          <option value="route_flapping">Route Flapping</option>
+          <option value="ingress_scan_burst">Ingress Scan Burst</option>
+          <option value="other_anomaly">Other Anomaly</option>
+        </select>
       </div>
       <div style="overflow-x: auto;">
         <table class="data-table">
           <thead>
             <tr>
               <th>Detected Time</th>
+              <th>Category</th>
               <th>Ingress</th>
               <th>Egress</th>
               <th>App</th>
@@ -1598,24 +1637,34 @@ def render_html_report(data: dict, output_file: str | Path) -> Path:
     }}
 
     // 7. Anomalies Explorer
-    function renderExplorer(filterText = '') {{
+    function renderExplorer() {{
       const tbody = document.getElementById('explorer-table-body');
       tbody.innerHTML = '';
-      const ft = filterText.toLowerCase();
+      const searchInput = document.getElementById('explorer-search');
+      const catSelect = document.getElementById('explorer-cat-filter');
+      const ft = (searchInput ? searchInput.value : '').toLowerCase();
+      const selCat = catSelect ? catSelect.value : '';
 
-      const filtered = DATA.explorer_rows.filter(r => 
-        r.ingress.toLowerCase().includes(ft) ||
-        r.egress.toLowerCase().includes(ft) ||
-        r.app.toLowerCase().includes(ft) ||
-        r.reason.toLowerCase().includes(ft) ||
-        r.customer.toLowerCase().includes(ft)
-      );
+      const filtered = DATA.explorer_rows.filter(r => {{
+        const matchesText = !ft || (
+          r.ingress.toLowerCase().includes(ft) ||
+          r.egress.toLowerCase().includes(ft) ||
+          r.app.toLowerCase().includes(ft) ||
+          r.reason.toLowerCase().includes(ft) ||
+          r.customer.toLowerCase().includes(ft) ||
+          r.category.toLowerCase().includes(ft)
+        );
+        const matchesCat = !selCat || r.category === selCat;
+        return matchesText && matchesCat;
+      }});
 
       filtered.slice(0, 100).forEach(r => {{
         const tr = document.createElement('tr');
         const scoreColor = r.score >= 6.0 ? 'var(--red)' : (r.score >= 5.0 ? 'var(--orange)' : 'var(--yellow)');
+        const catLabel = r.category.replace(/_/g, ' ');
         tr.innerHTML = `
           <td>${{r.time}}</td>
+          <td><span class="badge-cat badge-${{r.category}}">${{catLabel}}</span></td>
           <td><code style="color: #93c5fd;">${{r.ingress}}</code></td>
           <td><code style="color: #93c5fd;">${{r.egress}}</code></td>
           <td><strong>${{r.app}}</strong></td>
@@ -1629,8 +1678,8 @@ def render_html_report(data: dict, output_file: str | Path) -> Path:
       }});
     }}
 
-    function filterExplorer(val) {{
-      renderExplorer(val);
+    function filterExplorer() {{
+      renderExplorer();
     }}
 
     // Initial Launch

@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 # Column order of edge_anomalies.csv and new_flows.csv (most useful first).
 ANOMALY_COLUMNS = [
-    "detected_time", "status", "ingress", "egress", "srcIpPrefix", "dstIpPrefix",
+    "detected_time", "status", "anomaly_category", "ingress", "egress", "srcIpPrefix", "dstIpPrefix",
     "dstPort", "flow_type", "application", "reason", "score",
     "baseline_time", "baseline_source", "anomaly_start_time",
     "baseline_route_miles", "route_miles", "expected_route_miles", "z_miles",
@@ -320,6 +320,7 @@ def infer(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     edge_thr = lm.thresholds["edge_score"]
+    rules.edge_threshold = edge_thr
 
     # Only flows with a training baseline build router context (new flows are scored
     # but cannot distort the context of established flows).
@@ -451,6 +452,10 @@ def infer(
         "flows_scored": int(len(edges)),
         "flows_flagged": int(len(flagged)),
         "repeated_violations": int((flagged["status"] == STATUS_REPEATED).sum()),
+        "anomaly_categories": (
+            flagged["anomaly_category"].value_counts().to_dict()
+            if "anomaly_category" in flagged else {}
+        ),
         "new_flows_observed": int(len(new_flows)),
         "new_flow_bursts": int(len(bursts)),
         "routers_flagged": int(nodes["is_anomalous"].sum()),

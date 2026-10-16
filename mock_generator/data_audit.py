@@ -64,14 +64,16 @@ def run_data_quality_audit(snapshot_dir, num_expected_nodes=2000, sample_size=10
         physics_violations += (invalid_packets | invalid_size).sum()
 
         # Check Node ID Consistency
-        sub_map = dict(zip(df["src_id"], df["src_router"]))
-        if idx == 0:
-            node_map_reference = sub_map
-        else:
-            for n_id, name in sub_map.items():
-                if n_id in node_map_reference and node_map_reference[n_id] != name:
-                    print(f"  ❌ CRITICAL: Node ID Drift! ID {n_id} mapped to '{name}' vs '{node_map_reference[n_id]}'")
-                    break
+        router_col = "src_router" if "src_router" in df.columns else ("ingress" if "ingress" in df.columns else None)
+        if router_col is not None:
+            sub_map = dict(zip(df["src_id"], df[router_col]))
+            if idx == 0:
+                node_map_reference = sub_map
+            else:
+                for n_id, name in sub_map.items():
+                    if n_id in node_map_reference and node_map_reference[n_id] != name:
+                        print(f"  ❌ CRITICAL: Node ID Drift! ID {n_id} mapped to '{name}' vs '{node_map_reference[n_id]}'")
+                        break
 
         # Check Node Degrees (Graph Sparsity)
         unique_nodes_in_bucket = len(set(df["src_id"]).union(set(df["dst_id"])))
@@ -131,5 +133,6 @@ def run_data_quality_audit(snapshot_dir, num_expected_nodes=2000, sample_size=10
     print("==================================================")
 
 if __name__ == "__main__":
-    # Point this to your snapshots directory
-    run_data_quality_audit("./data_24h_10min", num_expected_nodes=2000)
+    import sys
+    target = sys.argv[1] if len(sys.argv) > 1 else "./data_24h_10min"
+    run_data_quality_audit(target, num_expected_nodes=2000)

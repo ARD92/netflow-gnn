@@ -30,6 +30,29 @@ STATUS_REPEATED = "repeated_violation"
 STATUS_NEW = "new_flow"
 ANOMALOUS_STATUSES = (STATUS_ANOMALY, STATUS_REPEATED)
 
+# Operational anomaly categories
+CATEGORY_NORMAL = "normal"
+CATEGORY_ROUTE_FLAPPING = "route_flapping"
+CATEGORY_FIBER_REROUTE = "fiber_reroute"
+CATEGORY_TRAFFIC_BURST = "traffic_burst"
+CATEGORY_BLACKHOLE = "blackhole"
+CATEGORY_REROUTE_CONGESTION = "reroute_with_congestion"
+CATEGORY_INGRESS_BURST = "ingress_scan_burst"
+CATEGORY_NEW_FLOW = "new_flow"
+CATEGORY_OTHER = "other_anomaly"
+
+CATEGORY_LABELS = {
+    CATEGORY_NORMAL: "Normal",
+    CATEGORY_ROUTE_FLAPPING: "Route Flapping",
+    CATEGORY_FIBER_REROUTE: "Fiber Reroute",
+    CATEGORY_TRAFFIC_BURST: "Traffic Burst / Congestion",
+    CATEGORY_BLACKHOLE: "Capacity Degradation / Blackhole",
+    CATEGORY_REROUTE_CONGESTION: "Reroute with Congestion",
+    CATEGORY_INGRESS_BURST: "Ingress Scan Burst",
+    CATEGORY_NEW_FLOW: "New Flow",
+    CATEGORY_OTHER: "Other Anomaly",
+}
+
 
 @dataclass
 class RuleConfig:
@@ -39,6 +62,7 @@ class RuleConfig:
     flap_min_reversals: int = 1     # direction reversals needed (1: low -> high -> low)
     new_flow_burst: int = 1000      # first-seen new flows from one ingress in one window
     interval: timedelta = DEFAULT_INTERVAL
+    edge_threshold: float = 4.0     # z-score threshold used for operational categorization
 
     @property
     def flap_steps(self) -> int:
@@ -102,15 +126,82 @@ def detect_flaps(edges: pd.DataFrame, cfg: RuleConfig) -> pd.DataFrame:
     return out.reindex(edges.index)
 
 
-def apply_rules(edges: pd.DataFrame, cfg: RuleConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+def categorize_anomalies(edges: pd.DataFrame, edge_threshold: float = 4.0) -> pd.Series:
+    """Classify each flow into an operational anomaly category.
+
+    Categories:
+    - route_flapping: Repeated route_miles oscillations (flapping status).
+    - reroute_with_congestion: Both distance (|z_miles| >= thr) and volume surge (z_bytes >= thr).
+    - fiber_reroute: High distance deviation (|z_miles| >= thr) with normal volume (|z_bytes| < thr).
+    - traffic_burst: High positive volume surge (z_bytes >= thr) with normal path distance (|z_miles| < thr).
+    - blackhole: Severe volume drop (z_bytes <= -thr) on an established flow.
+    - ingress_scan_burst: Unseen flow belonging to an ingress new-flow burst.
+    - new_flow: Unseen flow with no training baseline (observed, not an anomaly).
+    - other_anomaly: Flagged anomaly not fitting standard buckets.
+    - normal: Flows within nominal thresholds.
+    """
+    n = len(edges)
+    if n == 0:
+        return pd.Series(dtype=object)
+
+    thr = float(edge_threshold)
+    is_repeated = (edges["status"] == STATUS_REPEATED).to_numpy() if "status" in edges else np.zeros(n, dtype=bool)
+    if "repeated_violation" in edges:
+        is_repeated = is_repeated | edges["repeated_violation"].to_numpy(dtype=bool)
+
+    in_burst = edges["in_new_flow_burst"].to_numpy(dtype=bool) if "in_new_flow_burst" in edges else np.zeros(n, dtype=bool)
+    is_new = edges["is_new_flow"].to_numpy(dtype=bool) if "is_new_flow" in edges else np.zeros(n, dtype=bool)
+    if "is_anomalous" in edges:
+        is_anom = edges["is_anomalous"].to_numpy(dtype=bool)
+    elif "model_flag" in edges:
+        is_anom = edges["model_flag"].to_numpy(dtype=bool)
+    elif "score" in edges:
+        is_anom = edges["score"].to_numpy(dtype=float) >= thr
+    else:
+        is_anom = np.zeros(n, dtype=bool)
+
+    z_bytes = edges["z_bytes"].to_numpy(dtype=float) if "z_bytes" in edges else np.zeros(n, dtype=float)
+    z_miles = edges["z_miles"].to_numpy(dtype=float) if "z_miles" in edges else np.zeros(n, dtype=float)
+
+    miles_anom = np.abs(z_miles) >= thr
+    bytes_surge = z_bytes >= thr
+    bytes_drop = z_bytes <= -thr
+
+    conditions = [
+        is_repeated,
+        is_anom & miles_anom & bytes_surge,
+        is_anom & miles_anom & ~bytes_surge & ~bytes_drop,
+        is_anom & bytes_surge & ~miles_anom,
+        is_anom & bytes_drop,
+        in_burst,
+        is_new & ~is_anom,
+        is_anom,
+    ]
+    choices = [
+        CATEGORY_ROUTE_FLAPPING,
+        CATEGORY_REROUTE_CONGESTION,
+        CATEGORY_FIBER_REROUTE,
+        CATEGORY_TRAFFIC_BURST,
+        CATEGORY_BLACKHOLE,
+        CATEGORY_INGRESS_BURST,
+        CATEGORY_NEW_FLOW,
+        CATEGORY_OTHER,
+    ]
+    categories = np.select(conditions, choices, default=CATEGORY_NORMAL)
+    return pd.Series(categories, index=edges.index)
+
+
+def apply_rules(edges: pd.DataFrame, cfg: RuleConfig,
+                edge_threshold: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Assign each flow a status and find new-flow bursts.
 
     Status precedence: repeated_violation, then new_flow (no training
     baseline; observed, not an anomaly), then anomaly (model score at or
     above the edge threshold), else normal.
 
-    Returns the edges with ``status``, ``is_anomalous``, ``first_seen`` and
-    ``in_new_flow_burst`` added, and one row per (window, ingress) burst.
+    Returns the edges with ``status``, ``is_anomalous``, ``first_seen``,
+    ``in_new_flow_burst`` and ``anomaly_category`` added, and one row per
+    (window, ingress) burst.
     """
     edges = edges.join(detect_flaps(edges, cfg))
     edges["status"] = np.select(
@@ -130,6 +221,9 @@ def apply_rules(edges: pd.DataFrame, cfg: RuleConfig) -> tuple[pd.DataFrame, pd.
     in_burst = pd.MultiIndex.from_frame(edges[["window", "ingress"]]).isin(
         pd.MultiIndex.from_frame(bursts[["window", "ingress"]]))
     edges["in_new_flow_burst"] = first_new & in_burst
+
+    thr = edge_threshold if edge_threshold is not None else getattr(cfg, "edge_threshold", 4.0)
+    edges["anomaly_category"] = categorize_anomalies(edges, thr)
     return edges, bursts
 
 

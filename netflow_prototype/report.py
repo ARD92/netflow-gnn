@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from netflow_prototype.rules import STATUS_REPEATED, RuleConfig
+from netflow_prototype.rules import CATEGORY_LABELS, STATUS_REPEATED, RuleConfig
 
 RULE = "=" * 78
 
@@ -69,6 +69,11 @@ def write_report(
         f"Anomalous windows: {int(windows['is_anomalous'].sum())}",
         f"Anomalous flows  : {len(anomalies):,} "
         f"({int((anomalies['status'] == STATUS_REPEATED).sum())} repeated violations)",
+    ]
+    if "anomaly_category" in anomalies.columns and len(anomalies):
+        cat_counts = anomalies["anomaly_category"].value_counts()
+        lines.append("Categories       : " + ", ".join(f"{n:,} {CATEGORY_LABELS.get(k, k)}" for k, n in cat_counts.items()))
+    lines += [
         f"New flows        : {len(new_first):,} first observed (not anomalies), "
         f"{len(bursts)} new-flow burst{'' if len(bursts) == 1 else 's'} "
         f"({rules.new_flow_burst:,}+ from one ingress in one window)",
@@ -130,13 +135,26 @@ def write_report(
                       f"    route_miles flapping: {r.miles_history} "
                       f"({int(r.flap_changes)} changes)",
                       f"    anomaly started: {_t(r.anomaly_start_time)}"]
-        for r in single.head(max_flows_per_window).itertuples():
-            lines += ["", f"[ANOMALY] {_flow_line(r)}   score {r.score:.1f}"]
-            lines += [f"    {x}" for x in _change_lines(r, edge_thr)]
-            lines.append(f"    anomaly started: {_t(r.anomaly_start_time)}")
-        if len(single) > max_flows_per_window:
-            lines.append(f"\n... and {len(single) - max_flows_per_window:,} more anomalous "
-                         f"flows in this window (see edge_anomalies.csv)")
+
+        if "anomaly_category" in single.columns and len(single):
+            for cat, cat_flows in single.groupby("anomaly_category", sort=False):
+                cat_label = CATEGORY_LABELS.get(cat, cat.replace("_", " ").title())
+                lines += ["", f"-- Category: {cat_label} ({len(cat_flows)} flows) --"]
+                for r in cat_flows.head(max_flows_per_window).itertuples():
+                    lines += ["", f"[ANOMALY] {_flow_line(r)}   score {r.score:.1f}"]
+                    lines += [f"    {x}" for x in _change_lines(r, edge_thr)]
+                    lines.append(f"    anomaly started: {_t(r.anomaly_start_time)}")
+                if len(cat_flows) > max_flows_per_window:
+                    lines.append(f"\n... and {len(cat_flows) - max_flows_per_window:,} more "
+                                 f"{cat_label} flows in this window (see edge_anomalies.csv)")
+        else:
+            for r in single.head(max_flows_per_window).itertuples():
+                lines += ["", f"[ANOMALY] {_flow_line(r)}   score {r.score:.1f}"]
+                lines += [f"    {x}" for x in _change_lines(r, edge_thr)]
+                lines.append(f"    anomaly started: {_t(r.anomaly_start_time)}")
+            if len(single) > max_flows_per_window:
+                lines.append(f"\n... and {len(single) - max_flows_per_window:,} more anomalous "
+                             f"flows in this window (see edge_anomalies.csv)")
 
         flagged_routers = nodes[(nodes["window"] == ts) & nodes["is_anomalous"]]
         if len(flagged_routers):
